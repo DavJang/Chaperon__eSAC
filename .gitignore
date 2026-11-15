@@ -44,7 +44,7 @@ traffic/dperf*
 traffic/control_churn*
 traffic/flow_churn
 traffic/flow_throttle_loader
-traffic/cp_governor_loader
+traffic/resource_loader_rate
 apps/redis/redis-server
 apps/nginx/nginx
 suricata/bin/

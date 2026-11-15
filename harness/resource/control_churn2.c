@@ -1,5 +1,5 @@
 /* eSAC extended demo tenant: exercises MANY shared NIC control-plane APIs +
- * several host-memory allocators, for the governor threat-model experiment. */
+ * several host-memory allocators, for the resource throttle threat-model experiment. */
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>

@@ -1,24 +1,24 @@
 #!/bin/bash
-# API-OVERCALL attacker -> governor THROTTLE, on an idle 82599 PF (ixgbe DPDK works; mlx5 VF TIS fails).
+# API-OVERCALL attacker -> resource throttle THROTTLE, on an idle 82599 PF (ixgbe DPDK works; mlx5 VF TIS fails).
 # Binds 0000:5e:00.0 (idle, link-down, iommu grp 1 solo, no IP) to vfio-pci, runs control_churn2 under
-# cp_governor (bpftime override), collects CPGOV/MEMGOV DENY, then ALWAYS rebinds to ixgbe (trap).
+# resource_rate (bpftime override), collects CPGOV/MEMGOV DENY, then ALWAYS rebinds to ixgbe (trap).
 set -u
 F=/home/sungwoo/FINAL
 SRV=$F/agent/libbpftime-syscall-server.so; AGENT=$F/agent/libbpftime-agent.so
-GLOADER=$F/traffic/cp_governor_loader; OBJ=$F/comm_plane/bpf/cp_governor.bpf.o
+GLOADER=$F/traffic/resource_loader_rate; OBJ=$F/comm_plane/bpf/resource_rate.bpf.o
 APP=$F/traffic/control_churn2
 DD=/usr/local/lib/x86_64-linux-gnu; ETH=$DD/librte_ethdev.so; EALS=$DD/librte_eal.so
 PCI=0000:5e:00.0
 OUT=$F/results/gov82599_$(date +%s); mkdir -p "$OUT"
 say(){ echo "[$(date +%H:%M:%S)] $*"; }
 
-restore(){ sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f cp_governor 2>/dev/null
+restore(){ sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f resource_rate 2>/dev/null
   sudo -n /usr/local/bin/dpdk-devbind.py -u $PCI 2>/dev/null
   sudo -n /usr/local/bin/dpdk-devbind.py --bind=ixgbe $PCI 2>/dev/null
   say "RESTORED $PCI -> $(basename $(readlink /sys/bus/pci/devices/$PCI/driver 2>/dev/null))"; }
 trap restore EXIT
 
-sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f cp_governor 2>/dev/null; sleep 1
+sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f resource_rate 2>/dev/null; sleep 1
 sudo -n modprobe vfio-pci 2>/dev/null
 sudo -n /usr/local/bin/dpdk-devbind.py --bind=vfio-pci $PCI 2>/dev/null
 say "bound $PCI -> $(basename $(readlink /sys/bus/pci/devices/$PCI/driver 2>/dev/null)) (expect vfio-pci)"

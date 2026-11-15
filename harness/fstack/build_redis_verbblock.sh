@@ -1,8 +1,8 @@
 #!/bin/bash
-# Port redis RESP verb-block onto opt3 base; build blockget/blockset opt3 variants.
+# Port redis RESP verb-block onto mask-probe base; build blockget/blockset mask-probe variants.
 cd /home/sungwoo/esac40g_hpol_20261004 || exit 1
 python3 - <<'PY'
-src=open("comm_filter_opt3_16k.bpf.c").read()
+src=open("comm_filter_maskprobe_16k.bpf.c").read()
 anchor="    if (qs) qs->policy_hits++;\n\n    if (idx == 0) {"
 verb='''    if (qs) qs->policy_hits++;
 
@@ -35,15 +35,15 @@ verb='''    if (qs) qs->policy_hits++;
     if (idx == 0) {'''
 assert anchor in src, "ANCHOR_NOT_FOUND"
 src=src.replace(anchor, verb, 1)
-open("comm_filter_opt3_16k_redis.bpf.c","w").write(src)
+open("comm_filter_maskprobe_16k_redis.bpf.c","w").write(src)
 print("variant_written lines=%d" % src.count(chr(10)))
 PY
-[ -f comm_filter_opt3_16k_redis.bpf.c ] || { echo "VARIANT_FAIL"; exit 1; }
-CF="clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 -DESAC_STRICT -mllvm -unroll-threshold=10000 -I. -I/home/sungwoo/eSAC -I/home/sungwoo/eSAC/ebpf -c comm_filter_opt3_16k_redis.bpf.c"
-$CF -DBLOCK_GET -o comm_filter_opt3_16k_blockget.bpf.o 2>&1 | head -10
-echo "BLOCKGET rc=${PIPESTATUS[0]} size=$(stat -c %s comm_filter_opt3_16k_blockget.bpf.o 2>/dev/null)"
-$CF -DBLOCK_SET -o comm_filter_opt3_16k_blockset.bpf.o 2>&1 | head -10
-echo "BLOCKSET rc=${PIPESTATUS[0]} size=$(stat -c %s comm_filter_opt3_16k_blockset.bpf.o 2>/dev/null)"
+[ -f comm_filter_maskprobe_16k_redis.bpf.c ] || { echo "VARIANT_FAIL"; exit 1; }
+CF="clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 -DESAC_STRICT -mllvm -unroll-threshold=10000 -I. -I/home/sungwoo/eSAC -I/home/sungwoo/eSAC/ebpf -c comm_filter_maskprobe_16k_redis.bpf.c"
+$CF -DBLOCK_GET -o comm_filter_maskprobe_16k_blockget.bpf.o 2>&1 | head -10
+echo "BLOCKGET rc=${PIPESTATUS[0]} size=$(stat -c %s comm_filter_maskprobe_16k_blockget.bpf.o 2>/dev/null)"
+$CF -DBLOCK_SET -o comm_filter_maskprobe_16k_blockset.bpf.o 2>&1 | head -10
+echo "BLOCKSET rc=${PIPESTATUS[0]} size=$(stat -c %s comm_filter_maskprobe_16k_blockset.bpf.o 2>/dev/null)"
 # sanity: verify the verb strings are present in the objects
-echo "verb in blockget: $(strings comm_filter_opt3_16k_blockget.bpf.o 2>/dev/null | grep -c esac || echo n/a)"
-ls -la comm_filter_opt3_16k_block*.bpf.o 2>/dev/null
+echo "verb in blockget: $(strings comm_filter_maskprobe_16k_blockget.bpf.o 2>/dev/null | grep -c esac || echo n/a)"
+ls -la comm_filter_maskprobe_16k_block*.bpf.o 2>/dev/null

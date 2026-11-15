@@ -215,9 +215,9 @@ eSwitch/SR-IOV cannot do this.
 ---
 
 ## G. GENERALIZED GOVERNOR — all VF-unblockable control/resource APIs (LIVE 2026-11-07)
-One in-process governor throttles (rate) the shared NIC control plane and caps
+One in-process resource throttle throttles (rate) the shared NIC control plane and caps
 (quota) shared host memory, over MANY symbols at once. Baseline = all succeed;
-with governor:
+with resource throttle:
 
 | API | ret | policy | governed result |
 |---|---|---|---|
@@ -233,16 +233,16 @@ override at the API boundary -> the shared NIC control path / host allocator is
 never reached. SR-IOV/eSwitch cannot do this (they see packets, not API calls).
 
 Artifacts (FINAL):
-- comm_plane/bpf/cp_governor.bpf.o (+src cp_governor.bpf.c): 3 override progs
+- comm_plane/bpf/resource_rate.bpf.o (+src resource_rate.bpf.c): 3 override progs
   cp_rate_ptr (deny->0), cp_rate_int (deny->-EAGAIN), mem_quota_ptr (deny->0);
   tunable .rodata RATE_PER_SEC / BURST / MEM_QUOTA.
-- traffic/cp_governor_loader (+src comm_plane/loaders/src/cp_governor_loader.c):
+- traffic/resource_loader_rate (+src comm_plane/loaders/src/resource_loader_rate.c):
   reads a hooks.cfg (lib offset prog per line), attaches each as
   ATTACH_UPROBE_OVERRIDE (perf_event type 1008 + bpf_prog_attach BPF_MODIFY_RETURN),
   holds the bpftime shm alive.
 - traffic/control_churn (+src harness/resource/control_churn.c): tenant exercising
   all 5 APIs.
-- harness/resource/run_governor.sh: resolves offsets (readelf), STOP/CONT boot +
+- harness/resource/run_throttle.sh: resolves offsets (readelf), STOP/CONT boot +
   attach + report.
 
 EXTENSIBLE: add any exported librte_* symbol to hooks.cfg with cp_rate_* or

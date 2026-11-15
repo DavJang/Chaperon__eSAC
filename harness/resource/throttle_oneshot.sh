@@ -1,5 +1,5 @@
 #!/bin/bash
-# ONE-SHOT governor test on idle 82599 PF (vfio). control_churn2 calls dev_start once
+# ONE-SHOT resource throttle test on idle 82599 PF (vfio). control_churn2 calls dev_start once
 # (at setup) then churns promiscuous/mtu/mac/vlan/flow in a loop. Expect per-(pid,api):
 #  - dev_start: ALLOW(first) once -> CTLCHURN2 starts (init survives the hook)
 #  - promiscuous/mtu/mac/flow: 1st call ALLOW (real val), 2nd+ DENY (-11/NULL)
@@ -7,9 +7,9 @@
 set +u
 F=/home/sungwoo/FINAL; PCI=0000:5e:00.0; DD=/usr/local/lib/x86_64-linux-gnu
 ETH=$DD/librte_ethdev.so; EALS=$DD/librte_eal.so
-OUT=$F/results/gov_oneshot_$(date +%s); mkdir -p "$OUT"; R="$OUT/RESULT.txt"; : > "$R"
+OUT=$F/results/throttle_oneshot_$(date +%s); mkdir -p "$OUT"; R="$OUT/RESULT.txt"; : > "$R"
 say(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$R"; }
-restore(){ sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f cp_governor 2>/dev/null; sleep 1
+restore(){ sudo -n pkill -9 -f control_churn2 2>/dev/null; sudo -n pkill -9 -f resource_rate 2>/dev/null; sleep 1
   sudo -n /usr/local/bin/dpdk-devbind.py -u $PCI 2>/dev/null; sudo -n /usr/local/bin/dpdk-devbind.py --bind=ixgbe $PCI 2>/dev/null
   say "RESTORED $PCI -> $(basename $(readlink /sys/bus/pci/devices/$PCI/driver 2>/dev/null))"; echo EXP_DONE >> "$R"; }
 trap restore EXIT
@@ -33,7 +33,7 @@ say "hooks: $(wc -l < $CFG) APIs (prof set: flow_create/destroy, dev_start/stop,
 SHM=esac_os_$(date +%s%N)
 sudo -n bash -c "echo \$\$ > $OUT/cpid; kill -STOP \$\$; exec env BPFTIME_GLOBAL_SHM_NAME=$SHM SPDLOG_LEVEL=warn LD_PRELOAD=$F/agent/libbpftime-agent.so LD_LIBRARY_PATH=$DD $F/traffic/control_churn2 -l 2 -n 4 -a $PCI --file-prefix=os82 --in-memory -- 20" > "$OUT/churn.log" 2>&1 &
 sleep 3; CP=$(cat "$OUT/cpid")
-sudo -n env BPFTIME_GLOBAL_SHM_NAME=$SHM SPDLOG_LEVEL=warn LD_PRELOAD=$F/agent/libbpftime-syscall-server.so $F/traffic/cp_governor_loader $F/comm_plane/bpf/cp_governor.bpf.o "$CP" "$CFG" > "$OUT/loader.log" 2>&1 &
+sudo -n env BPFTIME_GLOBAL_SHM_NAME=$SHM SPDLOG_LEVEL=warn LD_PRELOAD=$F/agent/libbpftime-syscall-server.so $F/traffic/resource_loader_rate $F/comm_plane/bpf/resource_rate.bpf.o "$CP" "$CFG" > "$OUT/loader.log" 2>&1 &
 for j in $(seq 1 30); do grep -qi 'gov. ready' "$OUT/loader.log" 2>/dev/null && break; sleep 1; done
 say "loader: $(grep -a ready "$OUT/loader.log" | tail -1)"
 sudo -n kill -CONT "$CP"

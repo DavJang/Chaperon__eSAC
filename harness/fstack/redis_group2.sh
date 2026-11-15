@@ -6,7 +6,7 @@
 #       at ADMISSION (before the grab) -> node0 free unchanged -> redis unharmed.
 #   (B) API OVERCALL attacker: control_churn2 (--vdev=net_null0) hammers NIC control-plane APIs
 #       (rte_flow_create / promiscuous / mtu / mac / vlan / xstats + malloc/zmalloc/memzone).
-#       cp_governor (bpftime override) THROTTLES: rate-limited calls -> CPGOV/MEMGOV DENY, attacker
+#       resource_rate (bpftime override) THROTTLES: rate-limited calls -> CPGOV/MEMGOV DENY, attacker
 #       keeps running but its calls are refused -> redis unharmed.
 set -u
 D=/home/sungwoo/FINAL
@@ -18,9 +18,9 @@ IF1=enp59s0f1np1; CVF_NET=enp59s0f1v1; CIP=192.168.1.2; SIP=192.168.1.1; SVF=000
 RLOADER=$D/comm_plane/loaders/resource_loader
 RBPF=$D/comm_plane/bpf/resource_monitor.bpf.o
 EALSO=/usr/local/lib/x86_64-linux-gnu/librte_eal.so
-# governor (throttle)
+# resource throttle (throttle)
 SRV=$D/agent/libbpftime-syscall-server.so; AGENT=$D/agent/libbpftime-agent.so
-GLOADER=$D/traffic/cp_governor_loader; GOBJ=$D/comm_plane/bpf/cp_governor.bpf.o
+GLOADER=$D/traffic/resource_loader_rate; GOBJ=$D/comm_plane/bpf/resource_rate.bpf.o
 CHURN=$D/traffic/control_churn2
 DD=/usr/local/lib/x86_64-linux-gnu; ETH=$DD/librte_ethdev.so; EALS=$DD/librte_eal.so
 OUT=$D/results/redis_group2_$(date +%s); mkdir -p "$OUT"
@@ -40,7 +40,7 @@ sudo -n tc filter add dev $srep ingress protocol all flower skip_sw action mirre
 sudo -n tc filter add dev $crep ingress protocol all flower skip_sw action mirred egress redirect dev $srep 2>/dev/null
 sudo -n ip addr flush dev $CVF_NET 2>/dev/null; sudo -n ip addr add $CIP/24 dev $CVF_NET 2>/dev/null; sudo -n ip link set $CVF_NET up 2>/dev/null
 
-clean(){ sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f 'control_churn2' 2>/dev/null; sudo -n pkill -9 -f 'resource_loade[r]' 2>/dev/null; sudo -n pkill -9 -f 'cp_governor' 2>/dev/null; sleep 2; }
+clean(){ sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f 'control_churn2' 2>/dev/null; sudo -n pkill -9 -f 'resource_loade[r]' 2>/dev/null; sudo -n pkill -9 -f 'resource_rate' 2>/dev/null; sleep 2; }
 clean
 # ---- boot redis victim ----
 cd "$D/apps/redis"; RPID=$OUT/rpid
@@ -61,7 +61,7 @@ say "  node0free now=$(n0free)  (expect ~=$FREE0 = grab prevented)"
 say "  redis victim state=$(alive $RP)  PING=$(trc PING)   (expect ALIVE/PONG)"
 sudo -n kill -9 $RL 2>/dev/null; sudo -n pkill -9 -f 'resource_loade[r]' 2>/dev/null; sudo -n pkill -9 -f 'control_churn2' 2>/dev/null; sleep 2
 
-echo ""; say "############ (B) API OVERCALL attacker (control-plane churn) -> governor THROTTLE ############"
+echo ""; say "############ (B) API OVERCALL attacker (control-plane churn) -> resource throttle THROTTLE ############"
 CFG="$OUT/hooks.cfg"
 off(){ readelf -sW "$1" 2>/dev/null | awk -v s="$2" '$8==s || $8 ~ ("^" s "@"){print $2; exit}'; }
 { echo "$ETH $(off $ETH rte_flow_create) cp_rate_ptr"
@@ -80,10 +80,10 @@ sudo -n kill -CONT "$CP" 2>/dev/null
 for j in $(seq 1 25); do grep -q "CTLCHURN2 done" "$OUT/churn.log" 2>/dev/null && break; kill -0 "$CP" 2>/dev/null || break; sleep 1; done
 sleep 1
 say "  attacker pid=$CP state=$(alive $CP)   (expect ALIVE/finished = throttled not killed)"
-say "  governor denials: cp_denials=$(grep -ac 'CPGOV DENY' "$OUT/churn.log") mem_denials=$(grep -ac 'MEMGOV DENY' "$OUT/churn.log")"
+say "  resource throttle denials: cp_denials=$(grep -ac 'CPGOV DENY' "$OUT/churn.log") mem_denials=$(grep -ac 'MEMGOV DENY' "$OUT/churn.log")"
 say "  churn sample (NULL/-11 = throttled calls): $(grep -aE '^\[' "$OUT/churn.log" | tail -2 | tr '\n' '|')"
 say "  redis victim state=$(alive $RP)  PING=$(trc PING)   (expect ALIVE/PONG)"
-sudo -n kill -9 $GL 2>/dev/null; sudo -n pkill -9 -f 'control_churn2' 2>/dev/null; sudo -n pkill -9 -f 'cp_governor' 2>/dev/null
+sudo -n kill -9 $GL 2>/dev/null; sudo -n pkill -9 -f 'control_churn2' 2>/dev/null; sudo -n pkill -9 -f 'resource_rate' 2>/dev/null
 
 echo ""; say "===== redis victim FINAL state = $(alive $RP)  PING=$(trc PING) ====="
 clean

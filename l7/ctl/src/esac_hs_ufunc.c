@@ -125,19 +125,19 @@ struct esac_hs_batch_item { uint64_t pl_ptr; uint32_t pl_len; uint32_t act; };
 uint64_t gown_hs_scan(void *items, uint64_t n)
 {
     struct esac_hs_batch_item *it = (struct esac_hs_batch_item *)items;
-    if (!g_db || !it) { fprintf(stderr,"[GOWN_DBG] no db/items\n"); return 0; }
+    if (!g_db || !it) { fprintf(stderr,"[ESAC_DBG] no db/items\n"); return 0; }
     if (!t_scratch) { if (hs_clone_scratch(g_scratch_proto, &t_scratch) != HS_SUCCESS) return 0; }
     if (n > 128) n = 128;
-    fprintf(stderr,"[GOWN_DBG] called n=%llu\n",(unsigned long long)n);
+    fprintf(stderr,"[ESAC_DBG] called n=%llu\n",(unsigned long long)n);
     uint64_t hits = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (!it[i].pl_ptr || it[i].pl_len == 0) continue;
         int matched = 0;
         hs_scan(g_db, (const char*)(uintptr_t)it[i].pl_ptr, it[i].pl_len, 0, t_scratch, on_match, &matched);
-        fprintf(stderr,"[GOWN_DBG] i=%llu len=%u matched=%d\n",(unsigned long long)i,it[i].pl_len,matched);
+        fprintf(stderr,"[ESAC_DBG] i=%llu len=%u matched=%d\n",(unsigned long long)i,it[i].pl_len,matched);
         if (matched) { it[i].act = 2u; hits++; }
     }
-    fprintf(stderr,"[GOWN_DBG] hits=%llu\n",(unsigned long long)hits);
+    fprintf(stderr,"[ESAC_DBG] hits=%llu\n",(unsigned long long)hits);
     return hits;
 }
 

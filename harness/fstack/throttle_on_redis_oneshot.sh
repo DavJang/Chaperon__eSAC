@@ -1,5 +1,5 @@
 #!/bin/bash
-# ONE-SHOT governor on the REAL f-stack redis binary (mlx5 VF). Hooks redis's in-binary
+# ONE-SHOT resource throttle on the REAL f-stack redis binary (mlx5 VF). Hooks redis's in-binary
 # init-critical control calls (dev_start / promiscuous / mtu / flow_create) in ONE-SHOT mode:
 # f-stack calls each ONCE at init -> one-shot ALLOWS the first -> redis must still BOOT & PONG.
 # (Proves one-shot does not break mlx5 init; a later restart/churn call would be denied.)
@@ -7,8 +7,8 @@ set -u
 D=/home/sungwoo/FINAL
 AGENT=$D/agent/libbpftime-agent.so
 SERVER=$D/agent/libbpftime-syscall-server.so
-GLOADER=$D/traffic/cp_governor_loader
-OBJ=$D/comm_plane/bpf/cp_governor.bpf.o
+GLOADER=$D/traffic/resource_loader_rate
+OBJ=$D/comm_plane/bpf/resource_rate.bpf.o
 REDIS=$D/apps/redis/redis-server
 FFLIB=$D/lib/fstack-dpdk:/usr/local/lib/x86_64-linux-gnu
 CONF=$D/apps/redis/ff_redis.conf
@@ -39,7 +39,7 @@ CFG="$OUT/hooks.cfg"
 } > "$CFG"
 say "ONE-SHOT hooks on redis binary:"; cat "$CFG"
 
-sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f '[c]p_governor' 2>/dev/null
+sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f '[r]esource_loader_rate' 2>/dev/null
 sudo -n rm -f /dev/shm/bpftime* 2>/dev/null; sleep 2
 
 cd "$D/apps/redis"
@@ -54,15 +54,15 @@ say "gov: $(grep -a 'gov. ready' "$OUT/gov.log" | tail -1)"
 
 sudo -n kill -CONT $PID
 for j in $(seq 1 40); do grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null && break; kill -0 $PID 2>/dev/null || break; sleep 1; done
-if grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null; then say "redis BOOTED under ONE-SHOT governor (init-critical dev_start/promiscuous hooked)"; else say "redis did NOT reach Ready (init may be broken by hook)"; fi
+if grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null; then say "redis BOOTED under ONE-SHOT resource throttle (init-critical dev_start/promiscuous hooked)"; else say "redis did NOT reach Ready (init may be broken by hook)"; fi
 r=$(timeout 6 /usr/bin/redis-cli -h $SIP -p 6379 ping 2>&1); say "PING => '$r'  (expect PONG)"
 r2=$(timeout 6 /usr/bin/redis-cli -h $SIP -p 6379 set k HELLO 2>&1); r3=$(timeout 6 /usr/bin/redis-cli -h $SIP -p 6379 get k 2>&1)
 say "SET=$r2 GET=$r3"
 
-say "===== governor one-shot trace (ALLOW(first) = redis init calls allowed) ====="
+say "===== resource throttle one-shot trace (ALLOW(first) = redis init calls allowed) ====="
 grep -aE 'CPGOV|MEMGOV' "$OUT/redis.log" | head -20
 say "ALLOW(first)=$(grep -ac 'CPGOV ALLOW(first)' "$OUT/redis.log")  DENY(oneshot)=$(grep -ac 'CPGOV DENY(oneshot)' "$OUT/redis.log")  distinct_ip=$(grep -aoE 'ip=[0-9a-f]+' "$OUT/redis.log"|sort -u|wc -l)"
 
-sudo -n kill -9 "$PID" 2>/dev/null; sudo -n pkill -9 -f '[c]p_governor' 2>/dev/null
+sudo -n kill -9 "$PID" 2>/dev/null; sudo -n pkill -9 -f '[r]esource_loader_rate' 2>/dev/null
 sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n rm -f /dev/shm/bpftime* 2>/dev/null
 say "DONE OUT=$OUT"

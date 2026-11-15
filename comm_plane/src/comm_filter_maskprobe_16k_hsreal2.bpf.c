@@ -224,7 +224,7 @@ struct policy_lookup_args {
 };
 
 /* Return UINT32_MAX when this specificity class has no match. */
-/* opt3: probe only slots whose bit is set in the mask (base = class*5).
+/* mask-probe: probe only slots whose bit is set in the mask (base = class*5).
  * Key mutations run unconditionally so later probes see the right key state;
  * only the map lookup is gated. */
 static __noinline __u32 lookup_one_class(const struct policy_lookup_args *a,
@@ -282,7 +282,7 @@ lookup_action_slow(__u64 tenant_id, __u8 proto, __u16 dst_port,
     a.dst_port = dst_port;
     a.proto = proto;
 
-    /* opt3: probe mask packed in RCFG.features bits 8..27 (20 bits). */
+    /* mask-probe: probe mask packed in RCFG.features bits 8..27 (20 bits). */
     __u32 mask = (RCFG.features >> 8) & 0xFFFFFu;
     /* base: (tenant=0 / global=10) + (src_port exact=0 / wildcard=5) */
     if (mask & (0x1Fu << 0)) {               /* tenant, src_port exact */
@@ -416,16 +416,6 @@ struct {
  * without needing a 256-byte zero-initializer on the stack. */
 static const struct pkt_scratch g_zero_scratch;
 
-/* --- L7 BATCH (완성형): per-burst HS scratch; pkt_prescan content-gates then fills it --- */
-struct hs_batch_item { __u64 pl_ptr; __u32 pl_len; __u32 act; };
-struct hs_batch { struct hs_batch_item item[128]; };
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(struct hs_batch));
-} hs_batch_map SEC(".maps");
-
 struct pkt_iter_ctx {
     /* constant inputs */
     __u64  ptr_base;
@@ -443,8 +433,6 @@ struct pkt_iter_ctx {
      * every packet in the burst (was up to 32 redundant lookups per
      * burst). NULL only if the queue_stats map lookup itself failed. */
     struct queue_stats *qs;
-    struct hs_batch *batch;
-    __u32 l7_cand;
     /* per-burst outputs (written ≤1 time each; out_worst converges in 2) */
     __u32  out_sip;
     __u32  out_dip;
@@ -458,84 +446,6 @@ struct pkt_iter_ctx {
     __u16  kept;
     __u16  dropped;
 };
-
-static __noinline int pkt_prescan(__u32 idx, void *arg)
-{
-    struct pkt_iter_ctx *c = arg;
-    if (idx >= (__u32)c->n) return 1;
-    if (idx >= 128) return 1;
-    struct hs_batch *b = c->batch;
-    if (!b) return 0;
-    b->item[idx].pl_ptr = 0; b->item[idx].pl_len = 0; b->item[idx].act = 255u;
-
-    __u64 mbuf_ptr = 0;
-    if (c->mbuf_scratch) mbuf_ptr = c->mbuf_scratch->mbuf_ptrs[idx];
-    else if (read_user(&mbuf_ptr, (void *)(unsigned long)(c->ptr_base + (__u64)idx * 8), 8) < 0) return 0;
-    if (!mbuf_ptr) return 0;
-
-    unsigned char meta[48];
-    if (read_user(meta, (void *)(unsigned long)mbuf_ptr, sizeof(meta)) < 0) return 0;
-    __u32 off_ba = RCFG.mbuf_off_buf_addr, off_do = RCFG.mbuf_off_data_off, off_pl = RCFG.mbuf_off_pkt_len;
-    if (off_ba > sizeof(meta) - 8) off_ba = 0;
-    if (off_do > sizeof(meta) - 2) off_do = 16;
-    if (off_pl > sizeof(meta) - 4) off_pl = 36;
-    __u64 buf_addr = 0; __u16 data_off = 0; __u32 pkt_len = 0;
-    __builtin_memcpy(&buf_addr, meta + off_ba, 8);
-    __builtin_memcpy(&data_off, meta + off_do, 2);
-    __builtin_memcpy(&pkt_len,  meta + off_pl, 4);
-    if (!buf_addr || pkt_len < ETH_HLEN) return 0;
-
-    __u64 data_ptr = buf_addr + data_off;
-    unsigned char hdrbuf[96];
-    if (read_user(hdrbuf, (void *)(unsigned long)data_ptr, sizeof(hdrbuf)) < 0) return 0;
-
-    __u16 ether_type = ((__u16)hdrbuf[12] << 8) | hdrbuf[13];
-    __u32 l3_off = ETH_HLEN;
-    if (ether_type == ETHERTYPE_VLAN) {
-        if (pkt_len < l3_off + VLAN_HLEN) return 0;
-        ether_type = ((__u16)hdrbuf[l3_off + 2] << 8) | hdrbuf[l3_off + 3];
-        l3_off += VLAN_HLEN;
-    }
-    if (ether_type != ETHERTYPE_IPV4) return 0;
-    if (pkt_len < l3_off + IP_HLEN_MIN || l3_off + IP_HLEN_MIN > sizeof(hdrbuf)) return 0;
-    unsigned char *ip = hdrbuf + l3_off;
-    if ((ip[0] >> 4) != 4) return 0;
-    __u8 ihl = (ip[0] & 0x0f) * 4;
-    if (ihl < IP_HLEN_MIN) return 0;
-    __u16 frag = ((__u16)ip[6] << 8) | ip[7];
-    if ((frag & IPV4_FRAG_MF) || (frag & IPV4_FRAG_MASK)) return 0;
-    __u8 proto = ip[9];
-    if (proto == 6 || proto == 17) {
-        __u32 l4_off = l3_off + ihl;
-        __u32 l4hdr = 8;
-        if (proto == 6) {
-            if (l4_off + 13 <= sizeof(hdrbuf)) l4hdr = ((hdrbuf[l4_off + 12] >> 4) & 0xf) * 4;
-            else l4hdr = 20;
-            if (l4hdr < 20) l4hdr = 20;
-        }
-        __u32 payload_off = l4_off + l4hdr;
-        if (payload_off < pkt_len) {
-            __u64 pl_ptr = data_ptr + payload_off;
-            __u32 pl_len = pkt_len - payload_off;
-            if (pl_len > 1460) pl_len = 1460;
-            /* 완성형 CONTENT CANDIDATE GATE: only DNS(qd==1)/TLS-CH/HTTP shapes go to the provider. */
-            unsigned char pl12[12];
-            int cand = 0;
-            if (pl_len >= 12 && read_user(pl12, (void *)(unsigned long)pl_ptr, 12) == 0) {
-                __u16 qd = ((__u16)pl12[4] << 8) | pl12[5];
-                if (proto == 17 && qd == 1) cand = 1;                  /* DNS-ish */
-                else if (pl12[0] == 0x16 && pl12[5] == 0x01) cand = 1;  /* TLS ClientHello */
-                else if (pl12[0] >= 'A' && pl12[0] <= 'Z') cand = 1;    /* HTTP request line */
-            }
-            if (cand) {
-                b->item[idx].pl_ptr = pl_ptr;
-                b->item[idx].pl_len = pl_len;
-                c->l7_cand++;
-            }
-        }
-    }
-    return 0;
-}
 
 static __noinline int pkt_cb(__u32 idx, void *arg)
 {
@@ -693,21 +603,23 @@ static __noinline int pkt_cb(__u32 idx, void *arg)
                                  ((__u64)sport << 32) | sip, dip);
     if (qs) qs->policy_hits++;
 
-    /* --- L7 payload inspection via Hyperscan ufunc (batch read) --- */
+    /* OPT(l7-hs REAL): Hyperscan payload scan via agent built-in esac_hs1 ufunc */
     if ((proto == 6 || proto == 17) && action != ACT_KILL) {
-        __u32 l4_off = l3_off + ihl;
-        __u32 l4hdr = 8;
-        if (proto == 6) {
-            if (l4_off + 13 <= sizeof(hdrbuf)) l4hdr = ((hdrbuf[l4_off + 12] >> 4) & 0xf) * 4;
-            else l4hdr = 20;
-            if (l4hdr < 20) l4hdr = 20;
-        }
-        __u32 payload_off = l4_off + l4hdr;
-        if (payload_off < pkt_len) {
-            __u32 m = (c->batch && idx < 128) ? (__u32)c->batch->item[idx].act : 255u;
-            if (m != 255u) { action = (__u32)m; if ((m==2||m==3) && qs) qs->drop++; }
+        __u32 l4o = l3_off + ihl;
+        __u32 l4h = (proto == 6)
+            ? ((l4o + 12 < sizeof(hdrbuf)) ? (((hdrbuf[l4o + 12] >> 4) & 0xf) * 4) : 20)
+            : 8;
+        if (proto == 6 && l4h < 20) l4h = 20;
+        __u32 poff = l4o + l4h;
+        if (poff < pkt_len) {
+            __u64 plp = data_ptr + poff;
+            __u32 pll = pkt_len - poff;
+            if (pll > 1460) pll = 1460;
+            __u64 mtch = UFUNC_CALL_NAME_2("esac_hs1", (__u64)plp, (__u64)pll);
+            if (mtch) { action = ACT_DROP; if (qs) qs->drop++; }
         }
     }
+
 
     if (idx == 0) {
         c->out_sip   = sip;
@@ -817,22 +729,6 @@ parse_and_apply(__u64 ptr_base, __u16 n, __u64 cgroup_id,
      * not load. A literal unrolled sequence has no backward
      * branch at all, sidestepping the issue entirely. */
     {
-        /* L7 BATCH (완성형): content-gate prescan; call ufunc ONLY if a candidate exists */
-        {
-            __u32 bz = 0;
-            struct hs_batch *hb = bpf_map_lookup_elem(&hs_batch_map, &bz);
-            ctx.batch = hb;
-            ctx.l7_cand = 0;
-            if (hb) {
-                pkt_prescan(0,&ctx);pkt_prescan(1,&ctx);pkt_prescan(2,&ctx);pkt_prescan(3,&ctx);pkt_prescan(4,&ctx);pkt_prescan(5,&ctx);pkt_prescan(6,&ctx);pkt_prescan(7,&ctx);pkt_prescan(8,&ctx);pkt_prescan(9,&ctx);pkt_prescan(10,&ctx);pkt_prescan(11,&ctx);pkt_prescan(12,&ctx);pkt_prescan(13,&ctx);pkt_prescan(14,&ctx);pkt_prescan(15,&ctx);pkt_prescan(16,&ctx);pkt_prescan(17,&ctx);pkt_prescan(18,&ctx);pkt_prescan(19,&ctx);pkt_prescan(20,&ctx);pkt_prescan(21,&ctx);pkt_prescan(22,&ctx);pkt_prescan(23,&ctx);pkt_prescan(24,&ctx);pkt_prescan(25,&ctx);pkt_prescan(26,&ctx);pkt_prescan(27,&ctx);pkt_prescan(28,&ctx);pkt_prescan(29,&ctx);pkt_prescan(30,&ctx);pkt_prescan(31,&ctx);pkt_prescan(32,&ctx);pkt_prescan(33,&ctx);pkt_prescan(34,&ctx);pkt_prescan(35,&ctx);pkt_prescan(36,&ctx);pkt_prescan(37,&ctx);pkt_prescan(38,&ctx);pkt_prescan(39,&ctx);pkt_prescan(40,&ctx);pkt_prescan(41,&ctx);pkt_prescan(42,&ctx);pkt_prescan(43,&ctx);pkt_prescan(44,&ctx);pkt_prescan(45,&ctx);pkt_prescan(46,&ctx);pkt_prescan(47,&ctx);pkt_prescan(48,&ctx);pkt_prescan(49,&ctx);pkt_prescan(50,&ctx);pkt_prescan(51,&ctx);pkt_prescan(52,&ctx);pkt_prescan(53,&ctx);pkt_prescan(54,&ctx);pkt_prescan(55,&ctx);pkt_prescan(56,&ctx);pkt_prescan(57,&ctx);pkt_prescan(58,&ctx);pkt_prescan(59,&ctx);pkt_prescan(60,&ctx);pkt_prescan(61,&ctx);pkt_prescan(62,&ctx);pkt_prescan(63,&ctx);pkt_prescan(64,&ctx);pkt_prescan(65,&ctx);pkt_prescan(66,&ctx);pkt_prescan(67,&ctx);pkt_prescan(68,&ctx);pkt_prescan(69,&ctx);pkt_prescan(70,&ctx);pkt_prescan(71,&ctx);pkt_prescan(72,&ctx);pkt_prescan(73,&ctx);pkt_prescan(74,&ctx);pkt_prescan(75,&ctx);pkt_prescan(76,&ctx);pkt_prescan(77,&ctx);pkt_prescan(78,&ctx);pkt_prescan(79,&ctx);pkt_prescan(80,&ctx);pkt_prescan(81,&ctx);pkt_prescan(82,&ctx);pkt_prescan(83,&ctx);pkt_prescan(84,&ctx);pkt_prescan(85,&ctx);pkt_prescan(86,&ctx);pkt_prescan(87,&ctx);pkt_prescan(88,&ctx);pkt_prescan(89,&ctx);pkt_prescan(90,&ctx);pkt_prescan(91,&ctx);pkt_prescan(92,&ctx);pkt_prescan(93,&ctx);pkt_prescan(94,&ctx);pkt_prescan(95,&ctx);pkt_prescan(96,&ctx);pkt_prescan(97,&ctx);pkt_prescan(98,&ctx);pkt_prescan(99,&ctx);pkt_prescan(100,&ctx);pkt_prescan(101,&ctx);pkt_prescan(102,&ctx);pkt_prescan(103,&ctx);pkt_prescan(104,&ctx);pkt_prescan(105,&ctx);pkt_prescan(106,&ctx);pkt_prescan(107,&ctx);pkt_prescan(108,&ctx);pkt_prescan(109,&ctx);pkt_prescan(110,&ctx);pkt_prescan(111,&ctx);pkt_prescan(112,&ctx);pkt_prescan(113,&ctx);pkt_prescan(114,&ctx);pkt_prescan(115,&ctx);pkt_prescan(116,&ctx);pkt_prescan(117,&ctx);pkt_prescan(118,&ctx);pkt_prescan(119,&ctx);pkt_prescan(120,&ctx);pkt_prescan(121,&ctx);pkt_prescan(122,&ctx);pkt_prescan(123,&ctx);pkt_prescan(124,&ctx);pkt_prescan(125,&ctx);pkt_prescan(126,&ctx);pkt_prescan(127,&ctx);
-                if (ctx.l7_cand > 0) {
-                    volatile char bn[13];
-                    bn[0]='g';bn[1]='o';bn[2]='w';bn[3]='n';bn[4]='_';bn[5]='h';bn[6]='s';bn[7]='_';bn[8]='s';bn[9]='c';bn[10]='a';bn[11]='n';bn[12]=0;
-                    long bhid = ufunc_find_func_id((const char *)bn);
-                    if (bhid >= 0) UFUNC_CALL_2(bhid, (__u64)(unsigned long)&hb->item[0], (__u64)(n < 128 ? n : 128));
-                }
-            }
-        }
         if (pkt_cb(0, &ctx)) goto pkt_loop_done;
         if (pkt_cb(1, &ctx)) goto pkt_loop_done;
         if (pkt_cb(2, &ctx)) goto pkt_loop_done;

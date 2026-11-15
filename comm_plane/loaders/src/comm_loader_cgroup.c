@@ -622,7 +622,7 @@ static uint32_t ip_of(const char *s)
     if (inet_aton(s, &a) == 0) return 0;
     return a.s_addr;  /* FIX(2026-09-18): inet_aton() already returns network byte order; removed erroneous ntohl() that flipped it to host order and broke comm_policy IP matching */
 }
-/* opt3: build the per-(class,probe) presence mask from the policy.
+/* mask-probe: build the per-(class,probe) presence mask from the policy.
  * bit = base + probe;  base = (cgroup!=0?0:10) + (src_port!=0?0:5);
  * probe P0 sip!=0&dip!=0&dp!=0 / P1 sip0,dipA,dpA / P2 sip0,dip0,dpA /
  *       P3 sip0,dipA,dp0 / P4 sip0,dip0,dp0.  Rules not fitting a probe
@@ -1076,7 +1076,7 @@ int main(int argc, char **argv)
                 | (G.malformed_drop  ? FEAT_MALFORMED_DROP  : 0)
                 | (G.vlan_count      ? FEAT_VLAN_COUNT      : 0)
                 | (G.latency_sample  ? FEAT_LATENCY_SAMPLE  : 0);
-            rcfg->features |= (G.policy_path ? (compute_probe_mask(G.policy_path) << 8) : 0u); /* opt3 probe-mask */
+            rcfg->features |= (G.policy_path ? (compute_probe_mask(G.policy_path) << 8) : 0u); /* mask-probe probe-mask */
             rcfg->tenant_cgroup_id = tenant_cgroup_id;
             fprintf(stderr, "[comm] runtime_config: features=0x%x burst=%u cgroup_id=%llu\n",
                     rcfg->features, rcfg->max_burst_inspect,

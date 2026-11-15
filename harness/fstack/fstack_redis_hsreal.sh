@@ -1,6 +1,6 @@
 #!/bin/bash
 # REAL Hyperscan L7 on f-stack Redis: in-BPF payload scan via the agent's BUILT-IN esac_hs_scan ufunc.
-# comm_filter_opt3_16k_hsreal.bpf.o calls esac_hs_scan(payload_ptr,len) at RX; match(ESAC_HS_PATTERNS) -> ACT_DROP.
+# comm_filter_maskprobe_16k_hsreal.bpf.o calls esac_hs_scan(payload_ptr,len) at RX; match(ESAC_HS_PATTERNS) -> ACT_DROP.
 # RX-only loader (responses never hooked -> no TX-leg drop). Pattern = "SET" (inline redis cmd).
 # Expect: PING/GET served; SET blocked (timeout) by Hyperscan.
 set -u
@@ -9,7 +9,7 @@ AGENT=$D/agent/libbpftime-agent-hs.so        # HS-enabled agent
 HS_LIB=$D/l7/ctl/esac_hs_ufunc.so            # external .so provides esac_hs1 (we control + ESAC_HS_PATTERNS)
 SERVER=$D/agent/libbpftime-syscall-server.so
 LOADER=$D/comm_plane/loaders/comm_loader_cgroup_burst   # burst loader enables the ufunc dispatcher
-COMBO=$D/comm_plane/bpf/comm_filter_opt3_16k_hsreal.bpf.o
+COMBO=$D/comm_plane/bpf/comm_filter_maskprobe_16k_hsreal.bpf.o
 REDIS=$D/apps/redis/redis-server
 OFFS=$D/comm_plane/offsets.json
 FFLIB=$D/lib/fstack-dpdk:/usr/local/lib/x86_64-linux-gnu

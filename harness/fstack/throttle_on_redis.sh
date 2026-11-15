@@ -1,6 +1,6 @@
 #!/bin/bash
 # eSAC GOVERNOR attached to the REAL f-stack redis-server binary (static DPDK).
-# Proves: the control-plane governor hooks redis's in-binary shared-NIC control
+# Proves: the control-plane resource throttle hooks redis's in-binary shared-NIC control
 # calls (rte_eth_dev_start / rte_flow_create / rte_pktmbuf_pool_create), accounts
 # them per-tenant, and under a benign policy ALLOWS them -> redis boots & serves
 # (PONG) unbroken. bpf_printk "CPGOV ALLOW pid=<redis>" in redis.log = interception.
@@ -8,8 +8,8 @@ set -u
 D=/home/sungwoo/FINAL
 AGENT=$D/agent/libbpftime-agent.so
 SERVER=$D/agent/libbpftime-syscall-server.so
-GLOADER=$D/traffic/cp_governor_loader
-OBJ=$D/comm_plane/bpf/cp_governor.bpf.o
+GLOADER=$D/traffic/resource_loader_rate
+OBJ=$D/comm_plane/bpf/resource_rate.bpf.o
 REDIS=$D/apps/redis/redis-server
 FFLIB=$D/lib/fstack-dpdk:/usr/local/lib/x86_64-linux-gnu
 CONF=$D/apps/redis/ff_redis.conf
@@ -34,14 +34,14 @@ say "switchdev+hairpin ready (srep=$srep crep=$crep)"
 off(){ readelf -sW "$REDIS" 2>/dev/null | awk -v n="$1" '$8==n{print $2; exit}'; }
 CFG="$OUT/hooks.cfg"
 {
-  # Only rte_flow_create: a shared-eSwitch control call that is the governor's
+  # Only rte_flow_create: a shared-eSwitch control call that is the resource throttle's
   # real target (flow-rule churn) and is NOT on f-stack's init-critical
   # mempool/port-start path, so attaching it does not stall f-stack init.
   echo "$REDIS $(off rte_flow_create) cp_rate_ptr"
 } > "$CFG"
-say "hooks.cfg (governor on redis binary):"; cat "$CFG"
+say "hooks.cfg (resource throttle on redis binary):"; cat "$CFG"
 
-sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f '[c]p_governor' 2>/dev/null
+sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n pkill -9 -f '[r]esource_loader_rate' 2>/dev/null
 sudo -n rm -f /dev/shm/bpftime* 2>/dev/null; sleep 2
 
 cd "$D/apps/redis"
@@ -51,21 +51,21 @@ sudo -n setsid bash -c "echo \$\$ > $RPID; kill -STOP \$\$; exec env BPFTIME_GLO
 sleep 2; PID=$(cat $RPID 2>/dev/null); say "redis (STOPPED) pid=$PID"
 [ -z "$PID" ] && { say "BOOT FAIL"; exit 1; }
 
-# attach governor while redis is STOPPED (pre-EAL) so init-time control calls are intercepted
+# attach resource throttle while redis is STOPPED (pre-EAL) so init-time control calls are intercepted
 sudo -n env BPFTIME_GLOBAL_SHM_NAME=$SHM LD_PRELOAD="$SERVER" "$GLOADER" "$OBJ" "$PID" "$CFG" > "$OUT/gov.log" 2>&1 &
 for j in $(seq 1 30); do grep -q 'gov. ready' "$OUT/gov.log" 2>/dev/null && break; sleep 1; done
 say "gov: $(grep -a 'gov. ready' "$OUT/gov.log" | tail -1)"
 
 sudo -n kill -CONT $PID
 for j in $(seq 1 30); do grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null && break; kill -0 $PID 2>/dev/null || break; sleep 1; done
-if grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null; then say "redis BOOTED under governor (transparent)"; else say "redis did NOT reach Ready (check redis.log)"; fi
+if grep -q 'Ready to accept' "$OUT/redis.log" 2>/dev/null; then say "redis BOOTED under resource throttle (transparent)"; else say "redis did NOT reach Ready (check redis.log)"; fi
 
-r=$(timeout 6 /usr/bin/redis-cli -h $SIP -p 6379 ping 2>&1); say "PING => '$r'  (expect PONG = redis fully functional under governor)"
+r=$(timeout 6 /usr/bin/redis-cli -h $SIP -p 6379 ping 2>&1); say "PING => '$r'  (expect PONG = redis fully functional under resource throttle)"
 
-say "===== governor interception trace (CPGOV lines in redis.log = redis's real control calls accounted) ====="
+say "===== resource throttle interception trace (CPGOV lines in redis.log = redis's real control calls accounted) ====="
 grep -aE 'CPGOV|MEMGOV' "$OUT/redis.log" | head -20
 say "CPGOV_ALLOW=$(grep -ac 'CPGOV ALLOW' "$OUT/redis.log") CPGOV_DENY=$(grep -ac 'CPGOV DENY' "$OUT/redis.log")"
 
-sudo -n kill -9 "$PID" 2>/dev/null; sudo -n pkill -9 -f '[c]p_governor' 2>/dev/null
+sudo -n kill -9 "$PID" 2>/dev/null; sudo -n pkill -9 -f '[r]esource_loader_rate' 2>/dev/null
 sudo -n pkill -9 -x redis-server 2>/dev/null; sudo -n rm -f /dev/shm/bpftime* 2>/dev/null
 say "DONE OUT=$OUT"

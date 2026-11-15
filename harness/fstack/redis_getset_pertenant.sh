@@ -1,8 +1,8 @@
 #!/bin/bash
 # eSACfinal: PER-TENANT Redis GET/SET L7 enforcement on REAL f-stack Redis (intra switchdev).
-#   Tenant WEB   = GET-only  -> comm_filter_opt3_16k_blockset.bpf.o : SET dropped at RX, GET served
+#   Tenant WEB   = GET-only  -> comm_filter_maskprobe_16k_blockset.bpf.o : SET dropped at RX, GET served
 #   Tenant CACHE = full      -> comm_filter_maskprobe_16k.bpf.o      : both served
-#   Tenant LOG   = SET-only  -> comm_filter_opt3_16k_blockget.bpf.o : GET dropped at RX, SET served
+#   Tenant LOG   = SET-only  -> comm_filter_maskprobe_16k_blockget.bpf.o : GET dropped at RX, SET served
 # STOP/CONT pre-attach per PID (attach while redis STOPPED, before EAL/PMD poll).
 # Client = kernel redis-cli over client VF (enp59s0f1v1 192.168.1.2) -> switchdev hairpin -> server VF.
 # Verb scan is CASE-SENSITIVE on upper 'SET'/'GET' -> client must send UPPERCASE verbs.
@@ -12,8 +12,8 @@ AGENT=$D/agent/libbpftime-agent.so
 SERVER=$D/agent/libbpftime-syscall-server.so
 LOADER=$D/comm_plane/loaders/comm_loader_cgroup_maskprobe
 BASE=$D/comm_plane/bpf/comm_filter_maskprobe_16k.bpf.o
-BLOCKSET=$D/comm_plane/bpf/comm_filter_opt3_16k_blockset.bpf.o
-BLOCKGET=$D/comm_plane/bpf/comm_filter_opt3_16k_blockget.bpf.o
+BLOCKSET=$D/comm_plane/bpf/comm_filter_maskprobe_16k_blockset.bpf.o
+BLOCKGET=$D/comm_plane/bpf/comm_filter_maskprobe_16k_blockget.bpf.o
 REDIS=$D/apps/redis/redis-server
 OFFS=$D/comm_plane/offsets.json
 FFLIB=$D/lib/fstack-dpdk:/usr/local/lib/x86_64-linux-gnu

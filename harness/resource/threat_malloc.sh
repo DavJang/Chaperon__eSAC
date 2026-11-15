@@ -3,19 +3,19 @@
 # Tenant A churns rte_malloc (grows DPDK heap from the SHARED node0 hugepage pool);
 # Tenant B (victim) then needs 10 GB at EAL init. SR-IOV does NOT isolate host RAM.
 #   Phase 1 (no throttle): A grabs the pool -> B's rte_eal_init FAILS (cross-tenant DoS).
-#   Phase 2 (governor mem_quota on A's rte_malloc): A denied after quota -> pool preserved -> B OK.
+#   Phase 2 (resource throttle mem_quota on A's rte_malloc): A denied after quota -> pool preserved -> B OK.
 # No NIC needed (--no-pci --in-memory, anonymous hugepages, freed on exit).
 set +u
 F=/home/sungwoo/FINAL; DD=/usr/local/lib/x86_64-linux-gnu; EALS=$DD/librte_eal.so
 AGENT=$F/agent/libbpftime-agent.so; SRV=$F/agent/libbpftime-syscall-server.so
-GLOADER=$F/traffic/cp_governor_loader; GOBJ=$F/comm_plane/bpf/cp_governor.bpf.o
+GLOADER=$F/traffic/resource_loader_rate; GOBJ=$F/comm_plane/bpf/resource_rate.bpf.o
 MX=/home/sungwoo/old/dpdk_ebpf_work/DPDK_eBPF/stress/malloc_exhaust
 VIC=/home/sungwoo/old/dpdk_policy_demo/hp_victim
 OUT=$F/results/threat_malloc_$(date +%s); mkdir -p "$OUT"; R="$OUT/RESULT.txt"; : > "$R"
 say(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$R"; }
 n0(){ cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/free_hugepages; }
 alive(){ [ -d /proc/$1 ] || { echo DEAD; return; }; local s=$(awk '{print $3}' /proc/$1/stat 2>/dev/null); [ "$s" = Z ] && echo DEAD || echo ALIVE; }
-clean(){ sudo -n pkill -9 -f malloc_exhaus 2>/dev/null; sudo -n pkill -9 -f hp_victi 2>/dev/null; sudo -n pkill -9 -f cp_governor 2>/dev/null; sleep 2; }
+clean(){ sudo -n pkill -9 -f malloc_exhaus 2>/dev/null; sudo -n pkill -9 -f hp_victi 2>/dev/null; sudo -n pkill -9 -f resource_rate 2>/dev/null; sleep 2; }
 trap clean EXIT
 STEP=256; LOOPS=120   # A tries 256MB x120 = 30GB; VICTIM needs 10GB; node0 ~31GB
 clean; say "node0 free start = $(n0) pages (x2MB ~ $(( $(n0)*2/1024 ))GB); A step=${STEP}MB loops=$LOOPS; victim needs 10GB"
@@ -30,7 +30,7 @@ say "  VICTIM(10GB) => $(grep -aoE 'VICTIM_EAL_(OK|FAIL)' "$OUT/b1.log" | tail -
 sudo -n kill -9 $A1 2>/dev/null; sudo -n pkill -9 -f malloc_exhaus 2>/dev/null; sleep 3
 say "  after releasing A: node0 free = $(n0)"
 
-echo ""; say "############ PHASE 2 — WITH throttle (governor mem_quota on A's rte_malloc) ############"
+echo ""; say "############ PHASE 2 — WITH throttle (resource throttle mem_quota on A's rte_malloc) ############"
 CFG="$OUT/hooks.cfg"; off(){ readelf -sW "$1" 2>/dev/null | awk -v s="$2" '$8==s || $8 ~ ("^" s "@"){print $2; exit}'; }
 echo "$EALS $(off $EALS rte_malloc) mem_quota_ptr" > "$CFG"
 say "  hooks: rte_malloc -> mem_quota (count quota, deny after ~8 allocs)"

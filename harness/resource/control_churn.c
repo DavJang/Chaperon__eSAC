@@ -1,5 +1,5 @@
 /* eSAC demo tenant: exercises several shared NIC control-plane APIs + host-mem
- * allocation in a loop. Without eSAC all succeed; with the governor, control
+ * allocation in a loop. Without eSAC all succeed; with the resource throttle, control
  * ops are rate-throttled (flow_create->NULL, int APIs->-EAGAIN) and rte_malloc
  * is quota-capped (->NULL). Build: cc control_churn.c $(pkg-config --cflags --libs libdpdk) */
 #include <stdio.h>

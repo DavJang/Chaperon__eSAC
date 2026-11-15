@@ -1,7 +1,7 @@
 /* mem_churn (ATTACKER): DPDK app that churns rte_malloc(mb)+touch+rte_free in a tight loop for
  * DUR s. Holds NET-ZERO memory (frees every iteration) -> a HOLD/quota gate sees nothing to kill.
  * Large blocks force the DPDK heap to grow/shrink, driving kernel hugepage mmap/munmap (zeroing +
- * hugetlb_lock) on the SHARED node0 pool. rte_malloc is the governable entry point: a rate governor
+ * hugetlb_lock) on the SHARED node0 pool. rte_malloc is the governable entry point: a rate resource throttle
  * returning NULL (bpf_override_return 0) throttles the churn. Counts ok vs null (denied). */
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,7 +1,7 @@
 #!/bin/bash
 # eSAC on a STOCK, UNMODIFIED real app: /usr/bin/memcached (apt 1.6.14, kernel sockets, NO DPDK).
 # Demonstrates the only eSAC dimension that applies to an unmodified non-DPDK app:
-# Tamper Sentinel (syscall tracepoint watchdog). NO app modification, NO recompile, NO f-stack.
+# Tamper Sentinel (syscall tracepoint TamperSentinel). NO app modification, NO recompile, NO f-stack.
 #   1) stock memcached serves set/get (functional)
 #   2) arm Tamper Sentinel on its PID
 #   3) memcached STILL serves set/get (eSAC transparent)
@@ -38,7 +38,7 @@ sleep 2; PID=$(pgrep -f "memcached -p $PORT" | head -1); say "memcached pid=$PID
 say "  SET -> $(kv set HELLO)   GET -> $(kv get)"
 
 # (2) arm Tamper Sentinel on the UNMODIFIED app's pid (syscall tracepoint, no app change)
-say "===== (2) arm eSAC Tamper Sentinel on pid=$PID (syscall watchdog, app untouched) ====="
+say "===== (2) arm eSAC Tamper Sentinel on pid=$PID (syscall TamperSentinel, app untouched) ====="
 sudo -n bash "$SENTINEL" "$PID" 11 > "$OUT/sentinel.log" 2>&1 &
 for j in $(seq 1 15); do grep -qi 'Attaching' "$OUT/sentinel.log" 2>/dev/null && break; sleep 1; done
 say "  sentinel: $(grep -i Attaching "$OUT/sentinel.log" | head -1)"

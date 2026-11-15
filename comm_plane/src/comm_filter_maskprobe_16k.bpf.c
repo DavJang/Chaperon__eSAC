@@ -224,7 +224,7 @@ struct policy_lookup_args {
 };
 
 /* Return UINT32_MAX when this specificity class has no match. */
-/* opt3: probe only slots whose bit is set in the mask (base = class*5).
+/* mask-probe: probe only slots whose bit is set in the mask (base = class*5).
  * Key mutations run unconditionally so later probes see the right key state;
  * only the map lookup is gated. */
 static __noinline __u32 lookup_one_class(const struct policy_lookup_args *a,
@@ -282,7 +282,7 @@ lookup_action_slow(__u64 tenant_id, __u8 proto, __u16 dst_port,
     a.dst_port = dst_port;
     a.proto = proto;
 
-    /* opt3: probe mask packed in RCFG.features bits 8..27 (20 bits). */
+    /* mask-probe: probe mask packed in RCFG.features bits 8..27 (20 bits). */
     __u32 mask = (RCFG.features >> 8) & 0xFFFFFu;
     /* base: (tenant=0 / global=10) + (src_port exact=0 / wildcard=5) */
     if (mask & (0x1Fu << 0)) {               /* tenant, src_port exact */
@@ -602,24 +602,6 @@ static __noinline int pkt_cb(__u32 idx, void *arg)
     __u32 action = lookup_action(c->cgroup_id, proto, dport,
                                  ((__u64)sport << 32) | sip, dip);
     if (qs) qs->policy_hits++;
-
-    /* OPT(l7-hs REAL): Hyperscan payload scan via agent built-in esac_hs1 ufunc */
-    if ((proto == 6 || proto == 17) && action != ACT_KILL) {
-        __u32 l4o = l3_off + ihl;
-        __u32 l4h = (proto == 6)
-            ? ((l4o + 12 < sizeof(hdrbuf)) ? (((hdrbuf[l4o + 12] >> 4) & 0xf) * 4) : 20)
-            : 8;
-        if (proto == 6 && l4h < 20) l4h = 20;
-        __u32 poff = l4o + l4h;
-        if (poff < pkt_len) {
-            __u64 plp = data_ptr + poff;
-            __u32 pll = pkt_len - poff;
-            if (pll > 1460) pll = 1460;
-            __u64 mtch = UFUNC_CALL_NAME_2("esac_hs1", (__u64)plp, (__u64)pll);
-            if (mtch) { action = ACT_DROP; if (qs) qs->drop++; }
-        }
-    }
-
 
     if (idx == 0) {
         c->out_sip   = sip;
