@@ -56,9 +56,9 @@ C
 say "ldd check:"; ldd "$DH" 2>&1 | grep -i "not found" | tee -a "$R" || true
 sudo -n pkill -9 -x dperf_hist 2>/dev/null; sleep 1
 sudo -n env LD_LIBRARY_PATH=$LIB "$DH" -c "$OUT/s.conf" > "$OUT/srv.log" 2>&1 & sleep 6
-sudo -n env LD_LIBRARY_PATH=$LIB GOWN_HIST_FILE=$OUT/probe_hist.txt GOWN_HIST_START_SEC=3 "$DH" -c "$OUT/c.conf" > "$OUT/cli.log" 2>&1
+sudo -n env LD_LIBRARY_PATH=$LIB ESAC_HIST_FILE=$OUT/probe_hist.txt ESAC_HIST_START_SEC=3 "$DH" -c "$OUT/c.conf" > "$OUT/cli.log" 2>&1
 sudo -n pkill -9 -x dperf_hist 2>/dev/null; sleep 1
-say "=== probe client tail ==="; grep -aiE "gown_hist|p99|Segmentation|error|init" "$OUT/cli.log" | tail -8 | tee -a "$R"
-say "=== hist summary line ==="; grep -a "gown_hist" "$OUT/probe_hist.txt" 2>/dev/null | tee -a "$R"
+say "=== probe client tail ==="; grep -aiE "esac_hist|p99|Segmentation|error|init" "$OUT/cli.log" | tail -8 | tee -a "$R"
+say "=== hist summary line ==="; grep -a "esac_hist" "$OUT/probe_hist.txt" 2>/dev/null | tee -a "$R"
 say "hist lines=$(wc -l < "$OUT/probe_hist.txt" 2>/dev/null)"
 say "DONE OUT=$OUT"

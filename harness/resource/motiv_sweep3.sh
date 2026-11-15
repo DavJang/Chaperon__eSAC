@@ -133,9 +133,9 @@ mednz(){ local vals=(); for v in "$@"; do [ "${v%.*}" != 0 ] 2>/dev/null && vals
 onerep(){ local api=$1 rate=$2 tag=$3 try
   for try in 1 2; do
     if [ "$api" != none ]; then ( exec -a atksw bash -c "$(declare -f atksw); E4=$E4; AVF=$AVF; atksw $api $rate" ) & local ap=$!; sleep 1; fi
-    sudo -n env LD_LIBRARY_PATH=$LIB GOWN_HIST_FILE=$OUT/h_${tag}_t$try.txt GOWN_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_${tag}_t$try.log" 2>&1
+    sudo -n env LD_LIBRARY_PATH=$LIB ESAC_HIST_FILE=$OUT/h_${tag}_t$try.txt ESAC_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_${tag}_t$try.log" 2>&1
     [ "$api" != none ] && { kill $ap 2>/dev/null; sudo -n pkill -9 -f atksw 2>/dev/null; }
-    local L=$(grep -a 'gown_hist' "$OUT/h_${tag}_t$try.txt" 2>/dev/null)
+    local L=$(grep -a 'esac_hist' "$OUT/h_${tag}_t$try.txt" 2>/dev/null)
     local sm=$(echo "$L"|grep -oE 'samples=[0-9]+'|cut -d= -f2)
     if [ "${sm:-0}" -ge 5000 ] 2>/dev/null; then echo "$L"; return; fi
     # probe collapsed: recover server + hairpin, retry once

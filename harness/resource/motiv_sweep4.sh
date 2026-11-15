@@ -118,9 +118,9 @@ loadnow(){ sed 's/\x1b\[[0-9;]*m//g' "$OUT/ls.log" | grep -aoE 'pktRx +[0-9,]+' 
 
 runphase(){ local api=$1 rate=$2 tag="${api}_${rate}"
   if [ "$api" != none ]; then ( exec -a atksat bash -c "$(declare -f atksat); E4=$E4; AVF=$AVF; atksat $api $rate" ) & local ap=$!; sleep 1; fi
-  sudo -n env LD_LIBRARY_PATH=$LIB GOWN_HIST_FILE=$OUT/ph_$tag.txt GOWN_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_$tag.log" 2>&1
+  sudo -n env LD_LIBRARY_PATH=$LIB ESAC_HIST_FILE=$OUT/ph_$tag.txt ESAC_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_$tag.log" 2>&1
   [ "$api" != none ] && { kill $ap 2>/dev/null; sudo -n pkill -9 -f atksat 2>/dev/null; }
-  local L=$(grep -a 'gown_hist' "$OUT/ph_$tag.txt" 2>/dev/null)
+  local L=$(grep -a 'esac_hist' "$OUT/ph_$tag.txt" 2>/dev/null)
   local mean=$(echo "$L"|grep -oE 'mean_us=[0-9.]+'|cut -d= -f2); local p50=$(echo "$L"|grep -oE 'p50_us=[0-9]+'|cut -d= -f2)
   local p90=$(echo "$L"|grep -oE 'p90_us=[0-9]+'|cut -d= -f2); local p99=$(echo "$L"|grep -oE 'p99_us=[0-9]+'|cut -d= -f2)
   local p999=$(echo "$L"|grep -oE 'p999_us=[0-9]+'|cut -d= -f2); local sm=$(echo "$L"|grep -oE 'samples=[0-9]+'|cut -d= -f2); local lp=$(loadnow)

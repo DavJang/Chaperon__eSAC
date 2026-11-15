@@ -116,9 +116,9 @@ med3(){ printf '%s\n' "$@" | sort -n | sed -n '2p'; }
 
 onerep(){ local api=$1 rate=$2 tag=$3
   if [ "$api" != none ]; then ( exec -a atksw bash -c "$(declare -f atksw); E4=$E4; AVF=$AVF; atksw $api $rate" ) & local ap=$!; sleep 1; fi
-  sudo -n env LD_LIBRARY_PATH=$LIB GOWN_HIST_FILE=$OUT/h_$tag.txt GOWN_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_$tag.log" 2>&1
+  sudo -n env LD_LIBRARY_PATH=$LIB ESAC_HIST_FILE=$OUT/h_$tag.txt ESAC_HIST_START_SEC=4 "$DH" -c "$OUT/pc.conf" > "$OUT/pc_$tag.log" 2>&1
   [ "$api" != none ] && { kill $ap 2>/dev/null; sudo -n pkill -9 -f atksw 2>/dev/null; }
-  grep -a 'gown_hist' "$OUT/h_$tag.txt" 2>/dev/null; }
+  grep -a 'esac_hist' "$OUT/h_$tag.txt" 2>/dev/null; }
 
 runcell(){ local api=$1 rate=$2; local means=() p99s=() p50s=() samps=()
   for r in 1 2 3; do

@@ -122,7 +122,7 @@ uint64_t esac_hs_scan(const void *payload, uint32_t len)
 /* eSAC batch scanner (ADDED) with debug. layout matches hs_batch_item {u64 pl_ptr;u32 pl_len;u32 act}. */
 #include <stdio.h>
 struct esac_hs_batch_item { uint64_t pl_ptr; uint32_t pl_len; uint32_t act; };
-uint64_t gown_hs_scan(void *items, uint64_t n)
+uint64_t esac_hs_scan_dbg(void *items, uint64_t n)
 {
     struct esac_hs_batch_item *it = (struct esac_hs_batch_item *)items;
     if (!g_db || !it) { fprintf(stderr,"[ESAC_DBG] no db/items\n"); return 0; }
