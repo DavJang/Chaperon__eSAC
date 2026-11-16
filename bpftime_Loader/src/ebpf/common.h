@@ -1,43 +1,40 @@
 /* SPDX-License-Identifier: GPL-2.0
- * common.h — GUARD 통신 접근 제어 공통 자료형 & 상수
+ * common.h — GUARD comm access-control shared types & constants.
  *
- * BPF 쪽과 사용자 공간 로더가 함께 include한다.
- * __bpf__ 가드로 양쪽 컴파일 환경을 모두 지원한다.
- *
- * F-6 수정: volatile const struct runtime_config RCFG 선언 지원
- * F-7 수정: cgroup_id 기반 멀티프로세스/컨테이너 추적 지원
+ * Included by both the BPF side and the user-space loader; the __bpf__
+ * guard supports both compile environments.
  */
 #ifndef _GUARD_COMMON_H
 #define _GUARD_COMMON_H
 
 #ifndef __bpf__
-/* ── 사용자 공간: 커널 헤더에서 정수 타입 가져오기 ─────────────────── */
+/* User space: pull integer types from kernel headers. */
 #include <linux/types.h>
 #else
-/* ── BPF 타깃: 외부 헤더 없이 타입 직접 정의 ─────────────────────── */
+/* BPF target: define types directly, without external headers. */
 
-/* 부호 없는 정수 (커널 정의와 동일해야 함; __u64는 반드시 ull) */
+/* Unsigned integers (must match kernel definitions; __u64 must be ull). */
 typedef unsigned char        __u8;
 typedef unsigned short       __u16;
 typedef unsigned int         __u32;
 typedef unsigned long long   __u64;
 
-/* 부호 있는 정수 (bpf_helper_defs.h의 __s32, __s64 등에 필요) */
+/* Signed integers (needed for __s32, __s64 etc. in bpf_helper_defs.h). */
 typedef signed char          __s8;
 typedef signed short         __s16;
 typedef signed int           __s32;
 typedef signed long long     __s64;
 
-/* 빅엔디언/리틀엔디언 힌트 타입 (bpf_helper_defs.h 요구) */
+/* Big/little-endian hint types (required by bpf_helper_defs.h). */
 typedef __u16                __be16;
 typedef __u32                __be32;
 typedef __u64                __be64;
 typedef __u16                __le16;
 typedef __u32                __le32;
 typedef __u64                __le64;
-typedef __u32                __wsum;   /* checksum 타입 */
+typedef __u32                __wsum;   /* checksum type */
 
-/* BPF map 타입 (linux/bpf.h의 enum bpf_map_type 대체) */
+/* BPF map types (substitute for enum bpf_map_type in linux/bpf.h). */
 enum bpf_map_type {
     BPF_MAP_TYPE_UNSPEC                = 0,
     BPF_MAP_TYPE_HASH                  = 1,
@@ -72,26 +69,26 @@ enum bpf_map_type {
     BPF_MAP_TYPE_BLOOM_FILTER          = 30,
 };
 
-/* BPF map 업데이트 플래그 */
+/* BPF map update flags */
 #define BPF_ANY     0               /* create or update */
 #define BPF_NOEXIST 1               /* create only */
 #define BPF_EXIST   2               /* update only */
 
-/* perf_event_output: 현재 CPU 자동 선택 */
+/* perf_event_output: auto-select current CPU */
 #define BPF_F_CURRENT_CPU  0xffffffffULL
 
-/* x86_64 uprobe/kprobe 아키텍처 지정.
- * bpf_tracing.h가 이 매크로를 보고 PT_REGS_PARM* / PT_REGS_RC 를 정의.
- * common.h가 bpf_tracing.h 보다 먼저 include 되므로 여기서 정의. */
+/* x86_64 uprobe/kprobe arch selection.
+ * bpf_tracing.h uses this macro to define PT_REGS_PARM* / PT_REGS_RC.
+ * Defined here because common.h is included before bpf_tracing.h. */
 #ifndef __TARGET_ARCH_x86
 #define __TARGET_ARCH_x86
 #endif
 
-/* x86_64 struct pt_regs 완전 정의.
- * libbpf v1.8.0의 bpf_tracing.h는 이 구조체를 직접 정의하지 않고
- * bpf_helper_defs.h는 forward declaration만 한다.
- * BPF_UPROBE/BPF_URETPROBE 매크로가 멤버에 직접 접근하므로
- * 여기서 완전한 정의를 제공한다. */
+/* Full x86_64 struct pt_regs definition.
+ * libbpf v1.8.0's bpf_tracing.h does not define this struct, and
+ * bpf_helper_defs.h only forward-declares it. The BPF_UPROBE/
+ * BPF_URETPROBE macros access members directly, so provide the
+ * complete definition here. */
 struct pt_regs {
     unsigned long r15;
     unsigned long r14;
@@ -118,53 +115,49 @@ struct pt_regs {
 
 #endif /* __bpf__ */
 
-/* ── BPF 맵 핀 경로 ────────────────────────────────────────────────── */
+/* BPF map pin path */
 #define PIN_BASE  "/sys/fs/bpf/guard/comm"
 
-/* ── Action 코드 ──────────────────────────────────────────────────── */
+/* Action codes */
 #define ACT_ALLOW  0
-#define ACT_DROP   2   /* mbuf 무효화 (bpf_probe_write_user) */
-#define ACT_KILL   3   /* SIGKILL 직접 송신 (bpf_send_signal) */
+#define ACT_DROP   2   /* invalidate mbuf (bpf_probe_write_user) */
+#define ACT_KILL   3   /* send signal directly (bpf_send_signal) */
 
-/* ── Feature 플래그 (runtime_config.features 비트마스크) ─────────── */
+/* Feature flags (runtime_config.features bitmask) */
 #define FEAT_ENFORCEMENT     (1u << 0)
 #define FEAT_FRAGMENT_DROP   (1u << 1)
 #define FEAT_MALFORMED_DROP  (1u << 2)
 #define FEAT_VLAN_COUNT      (1u << 3)
 #define FEAT_LATENCY_SAMPLE  (1u << 4)
 
-/* ── 레이턴시 히스토그램 버킷 수 ──────────────────────────────────── */
+/* Latency histogram bucket count */
 #define LAT_BUCKETS 64
 
-/* ── F-6: 런타임 설정 (BPF .rodata 섹션에 주입) ──────────────────── */
-/*
- * BPF 쪽: const volatile struct runtime_config RCFG = { defaults };
- * 로더 쪽: bpf_map__initial_value(rodata, &sz) 로 포인터를 얻어
- *          mbuf 오프셋 등을 프로그램 로드 전에 덮어쓴다.
- */
+/* Runtime config (injected into the BPF .rodata section).
+ * BPF side:   const volatile struct runtime_config RCFG = { defaults };
+ * Loader side: obtain a pointer via bpf_map__initial_value(rodata, &sz)
+ *              and overwrite mbuf offsets etc. before program load. */
 struct runtime_config {
-    __u32 mbuf_off_buf_addr;   /* rte_mbuf.buf_addr 의 바이트 오프셋  */
-    __u32 mbuf_off_data_off;   /* rte_mbuf.data_off 의 바이트 오프셋  */
-    __u32 mbuf_off_pkt_len;    /* rte_mbuf.pkt_len  의 바이트 오프셋  */
-    __u32 mbuf_off_data_len;   /* rte_mbuf.data_len 의 바이트 오프셋  */
-    __u32 max_burst_inspect;   /* burst 중 검사할 패킷 최대 개수 (≤32) */
-    __u32 kill_signal;         /* ACT_KILL 시 전송 시그널 (9=SIGKILL)   */
-    __u32 enabled;             /* 0이면 모든 probe가 즉시 반환          */
-    __u32 generation;          /* 설정 갱신 카운터 (로더가 time() 주입) */
-    __u32 features;            /* FEAT_* 비트마스크                     */
+    __u32 mbuf_off_buf_addr;   /* byte offset of rte_mbuf.buf_addr */
+    __u32 mbuf_off_data_off;   /* byte offset of rte_mbuf.data_off */
+    __u32 mbuf_off_pkt_len;    /* byte offset of rte_mbuf.pkt_len  */
+    __u32 mbuf_off_data_len;   /* byte offset of rte_mbuf.data_len */
+    __u32 max_burst_inspect;   /* max packets to inspect per burst (<=32) */
+    __u32 kill_signal;         /* signal sent on ACT_KILL (9=SIGKILL) */
+    __u32 enabled;             /* 0 = all probes return immediately */
+    __u32 generation;          /* config update counter (loader injects time()) */
+    __u32 features;            /* FEAT_* bitmask */
 };
 
-/* ── 정책 맵 키 ───────────────────────────────────────────────────── */
-/*
- * F-7 수정: cgroup_id 필드 추가.
- *   cgroup_id = 0  → wildcard (모든 cgroup에 적용)
- *   cgroup_id != 0 → 해당 cgroup 전용 규칙
+/* Policy map key.
+ *   cgroup_id = 0  → wildcard (applies to all cgroups)
+ *   cgroup_id != 0 → rule specific to that cgroup
  *
- * 조회 우선순위 (lookup_action 참조):
- *   1. (cgroup, proto, dst_port, src_ip, dst_ip)  — 완전 일치
- *   2. (cgroup, proto, dst_port, 0, 0)            — IP 와일드카드
- *   3. (cgroup, proto, 0, 0, 0)                   — 포트+IP 와일드카드
- *   4. (0, proto, dst_port, src_ip, dst_ip)       — cgroup 와일드카드
+ * Lookup priority (see lookup_action):
+ *   1. (cgroup, proto, dst_port, src_ip, dst_ip)  — exact match
+ *   2. (cgroup, proto, dst_port, 0, 0)            — IP wildcard
+ *   3. (cgroup, proto, 0, 0, 0)                   — port+IP wildcard
+ *   4. (0, proto, dst_port, src_ip, dst_ip)       — cgroup wildcard
  *   5. (0, proto, dst_port, 0, 0)
  *   6. (0, proto, 0, 0, 0)
  */
@@ -179,17 +172,15 @@ struct comm_policy_key {
     __u16 _pad;
 };
 
-/* ── 정책 맵 값 ───────────────────────────────────────────────────── */
+/* Policy map value */
 struct comm_policy_value {
     __u32 action;     /* ACT_* */
-    __u32 hit_count;  /* 원자적으로 증가 */
+    __u32 hit_count;  /* incremented atomically */
 };
 
-/* ── 이벤트 (perf ring → 사용자 공간) ────────────────────────────── */
-/*
- * F-7 수정: cgroup_id 필드 추가.
- * 로더가 이 값으로 어느 컨테이너/프로세스 그룹의 패킷인지 식별.
- */
+/* Event (perf ring → user space).
+ * Loader uses cgroup_id to identify which container/process group a
+ * packet belongs to. */
 struct comm_event {
     __u64 ts_ns;
     __u32 pid;
@@ -208,25 +199,25 @@ struct comm_event {
     __u16 hook_dir;          /* 1=RX, 2=TX; preserves event layout */
 };
 
-/* ── 큐별 통계 (PERCPU 맵 값) ─────────────────────────────────────── */
+/* Per-queue stats (PERCPU map value) */
 struct queue_stats {
     __u64 rx;
     __u64 tx;
-    __u64 drop;            /* ACT_DROP: mbuf 무효화 횟수               */
+    __u64 drop;            /* ACT_DROP: mbuf-invalidation count */
     __u64 allow;
     __u64 vlan_seen;
     __u64 frag_drop;
     __u64 malformed_drop;
     __u64 policy_hits;
     __u64 parse_fail;
-    __u64 rx_zero_burst;   /* RX starvation: zero-return burst 횟수    */
-    __u64 tx_drop;         /* TX drop: nb_sent < nb_requested 횟수     */
+    __u64 rx_zero_burst;   /* RX starvation: zero-return burst count */
+    __u64 tx_drop;         /* TX drop: nb_sent < nb_requested count */
 };
 
-/* ── 취약성 이벤트 (vuln_events → 사용자 공간) ───────────────────── */
-#define VULN_RX_STARVATION  1u  /* zero-return burst 연속 발생          */
-#define VULN_TX_DROP        2u  /* nb_sent < nb_requested               */
-#define VULN_MBUF_MALFORM   3u  /* null buf_addr / oversized pkt_len    */
+/* Vulnerability events (vuln_events → user space) */
+#define VULN_RX_STARVATION  1u  /* consecutive zero-return bursts */
+#define VULN_TX_DROP        2u  /* nb_sent < nb_requested */
+#define VULN_MBUF_MALFORM   3u  /* null buf_addr / oversized pkt_len */
 
 struct vuln_event {
     __u64 ts_ns;
@@ -237,10 +228,10 @@ struct vuln_event {
     __u16 queue_id;
     __u8  vuln_type;     /* VULN_* */
     __u8  _pad[3];
-    __u32 detail;        /* starvation: 연속 zero 횟수, tx_drop: 손실 수 */
+    __u32 detail;        /* starvation: consecutive zero count; tx_drop: lost count */
 };
 
-/* ── 레이턴시 히스토그램 ──────────────────────────────────────────── */
+/* Latency histogram */
 struct latency_hist {
     __u64 buckets[LAT_BUCKETS];
     __u64 sum;
@@ -249,7 +240,7 @@ struct latency_hist {
 };
 
 
-/* ── 자원 감시 모듈 공용 자료형 ─────────────────────────────────── */
+/* Resource-monitor module shared types */
 
 #define API_RTE_EAL_INIT              0u
 #define API_RTE_PKTMBUF_POOL_CREATE   1u
@@ -261,17 +252,17 @@ struct latency_hist {
 #define API_RTE_MALLOC                7u
 #define API_RTE_ZMALLOC               8u
 #define API_RTE_MEMZONE_RESERVE       9u
-#define API_RTE_EAL_REMOTE_LAUNCH    10u  /* lcore 과점유 감지 */
+#define API_RTE_EAL_REMOTE_LAUNCH    10u  /* lcore over-subscription detect */
 
 struct resource_policy {
-    __u64 max_socket_mem_mb;       /* rte_eal_init --socket-mem 합계 (MB, 0=무제한) */
+    __u64 max_socket_mem_mb;       /* rte_eal_init --socket-mem total (MB, 0=unlimited) */
     __u32 max_mbuf_count;
     __u64 max_mbuf_total_bytes;
     __u32 max_rx_queues;
     __u32 max_tx_queues;
     __u32 max_ports;
     __u64 max_rte_malloc_bytes;
-    __u32 max_lcore_count;         /* 허용 lcore 최대 수 (0=무제한) */
+    __u32 max_lcore_count;         /* max allowed lcores (0=unlimited) */
     __u32 action_on_violation;
     __u64 binary_hash;
 };
@@ -279,7 +270,7 @@ struct resource_policy {
 struct pid_resource_stats {
     __u32 pid;
     __u32 tgid;
-    __u64 socket_mem_mb;           /* rte_eal_init --socket-mem 합계 (MB) */
+    __u64 socket_mem_mb;           /* rte_eal_init --socket-mem total (MB) */
     __u32 mbuf_pool_count;
     __u32 mbuf_total_count;
     __u64 mbuf_total_bytes;
@@ -287,7 +278,7 @@ struct pid_resource_stats {
     __u32 rx_queues_total;
     __u32 tx_queues_total;
     __u32 ports_configured;
-    __u32 lcore_count;             /* rte_eal_remote_launch 호출 횟수  */
+    __u32 lcore_count;             /* rte_eal_remote_launch call count */
     __u64 rte_malloc_bytes;
     __u64 first_seen_ns;
     __u64 last_event_ns;

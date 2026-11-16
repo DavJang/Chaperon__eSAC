@@ -1,18 +1,10 @@
 /*
- * r_loader.c
- * --------------------------------------------------------------
- * Phase 1 자원 접근 제어 로더.
+ * r_loader.c - resource access-control loader.
+ * Opens the BPF object, injects runtime_config into .rodata, loads it,
+ * attaches uprobes to DPDK resource APIs, loads the policy map, and polls
+ * the res_events ringbuf (SIGUSR1 dumps pid_res_stats).
  *
- * 책임:
- *   1) r_filter_monitor.bpf.o 열기.
- *   2) .rodata (runtime_config) 에 kill_signal/enabled/features 주입.
- *      → 모든 가변값은 eBPF 맵/.rodata 기반, 하드코딩 X.
- *   3) BPF load.
- *   4) libdpdk.so / librte_*.so 의 자원 API 들에 uprobe attach.
- *   5) resource_policy.json 을 파싱해 res_policy 맵 주입.
- *   6) res_events ringbuf 폴링 + SIGUSR1 → pid_res_stats 덤프.
- *
- * 빌드: gcc r_loader.c -o r_loader -lbpf -lelf -lz
+ * Build: gcc r_loader.c -o r_loader -lbpf -lelf -lz
  */
 
 #define _GNU_SOURCE
@@ -36,26 +28,18 @@
 
 #include "../ebpf/common.h"
 
-/* ---- 후킹 대상 심볼 ---- */
+/* ---- hook target symbols ---- */
 struct hook_target {
     const char *prog_uprobe;
     const char *prog_uretprobe;
     const char *symbol;
-    const char *libname;   /* FIX(2026-09-20): 실제 심볼이 있는 .so 파일명.
-                             * 이전에는 모든 훅이 --lib 인자 하나(보통
-                             * librte_eal.so)에만 attach되어, rte_eal_init/
-                             * rte_zmalloc/rte_memzone_reserve 등 진짜로
-                             * librte_eal.so 안에 있는 함수들만 우연히
-                             * 동작했다. rte_pktmbuf_pool_create(librte_
-                             * mbuf.so)와 rte_eth_dev_configure 계열
-                             * (librte_ethdev.so)은 다른 파일에 있는
-                             * 심볼이라 offset 0(파일 시작, ELF 헤더)에
-                             * uprobe가 붙어 "attached" 로그는 찍히지만
-                             * 실제로는 절대 안 터지는 상태였다 (R3/R4
-                             * 재설계 중 발견: VIOLATION=0, greedy가 정책
-                             * 위반해도 안 죽음). --lib 인자의 디렉토리를
-                             * 기준으로 이 필드의 파일명을 조합해서 진짜
-                             * 심볼이 있는 라이브러리에 attach하도록 수정. */
+    const char *libname;   /* Name of the .so that actually contains the symbol.
+                             * Each symbol must be attached in its own library:
+                             * attaching every hook to a single --lib (e.g.
+                             * librte_eal.so) silently lands a uprobe at offset 0
+                             * for symbols that live elsewhere, so it logs
+                             * "attached" but never fires. Combine --lib's
+                             * directory with this filename to attach correctly. */
 };
 
 static const struct hook_target HOOKS[] = {
@@ -87,7 +71,7 @@ struct options {
     const char *policy_path;
     int verbose;
     int json;
-    int kill_signal;     /* 가변, 기본 9(SIGKILL) */
+    int kill_signal;     /* configurable, default 9 (SIGKILL) */
     int attach_pid;      /* optional process-scoped uprobe target */
     int no_pin;          /* avoid altering shared bpffs pins during isolated runs */
 };
@@ -100,7 +84,7 @@ static void usage(const char *prog)
         "          [--kill-signal N] [--attach-pid PID] [--no-pin] [--json] [-v]\n", prog);
 }
 
-/* ---- JSON 파서 (간소) ---- */
+/* ---- minimal JSON parser ---- */
 
 static int json_extract_u64(const char *blob, const char *key, uint64_t *out)
 {
@@ -135,7 +119,7 @@ static int json_extract_str(const char *blob, const char *key,
     out[i] = 0;
     return 0;
 }
-/* ---- 심볼 오프셋 조회 ---- */
+/* ---- symbol offset lookup ---- */
 /*
  * shared lib (.so)  : nm -D gives virtual addr == file offset (PIC, base=0)
  * PIE executable    : nm gives virtual addr ≈ file offset (LOAD base=0)
@@ -279,7 +263,7 @@ static int load_policy_file(const char *path, int policy_map_fd)
     return 0;
 }
 
-/* ---- 이벤트 핸들러 ---- */
+/* ---- event handler ---- */
 
 static const char *api_name(uint32_t id)
 {
@@ -361,7 +345,7 @@ static int handle_event(void *ctx, void *data, size_t sz)
     return 0;
 }
 
-/* ---- SIGUSR1: pid_res_stats 덤프 ---- */
+/* ---- SIGUSR1: dump pid_res_stats ---- */
 
 static void dump_pid_stats(int fd)
 {
@@ -401,11 +385,10 @@ static int bump_rlimit(void)
     return setrlimit(RLIMIT_MEMLOCK, &r) ? -1 : 0;
 }
 
-/* 이전 실행에서 남은 pinned BPF 맵을 자동으로 삭제.
- * LIBBPF_PIN_BY_NAME 은 /sys/fs/bpf/<map_name> 에 고정하고,
- * bpf_object__pin_maps 는 PIN_BASE/<map_name> 에 고정한다.
- * 구조체가 변경된 채로 재실행하면 "parameter mismatch" 오류가 발생하므로
- * 로더 시작 시 두 경로를 모두 제거한다. */
+/* Remove pinned BPF maps left over from a previous run. A changed struct
+ * layout causes a "parameter mismatch" error on reload, so clear the pins
+ * at startup (LIBBPF_PIN_BY_NAME pins under /sys/fs/bpf/<map_name>;
+ * bpf_object__pin_maps pins under PIN_BASE/<map_name>). */
 static void purge_pinned_maps(struct bpf_object *obj)
 {
     (void)obj;
@@ -495,7 +478,7 @@ int main(int argc, char **argv)
         bpf_object__pin_maps(obj, PIN_BASE);
     }
 
-    /* .rodata 주입 */
+    /* inject .rodata */
     struct bpf_map *rodata = find_rodata_map(obj);
     if (rodata) {
         size_t value_size = 0;
@@ -506,7 +489,7 @@ int main(int argc, char **argv)
             rcfg->generation  = (__u32)time(NULL);
             rcfg->features    = 0;
             rcfg->max_burst_inspect = 32;
-            /* Phase 1 은 mbuf 오프셋 안 쓰지만 동일 struct 사용 */
+            /* mbuf offsets are unused here but share the same struct */
             rcfg->mbuf_off_buf_addr = 0;
             rcfg->mbuf_off_data_off = 0;
             rcfg->mbuf_off_pkt_len  = 0;

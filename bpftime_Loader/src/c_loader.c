@@ -1,36 +1,10 @@
 /*
- * comm_loader.c
- * --------------------------------------------------------------
- * Phase 2 통신 접근 제어 로더.
+ * comm_loader.c - userspace loader for the comm-access-control BPF filter.
+ * Injects mbuf offsets into .rodata, loads the BPF object, hooks RX/TX
+ * (API-level rte_eth_rx_burst or driver-level PMD symbols), loads the JSON
+ * policy, and polls the comm_events ringbuf.
  *
- * 책임:
- *   1) comm_filter.bpf.o 를 연다.
- *   2) tools/discover_offsets 가 출력한 mbuf 오프셋을
- *      libbpf .rodata (runtime_config) 에 주입한다.
- *   3) BPF load.
- *   4) RX 후킹:
- *      - API level: librte_ethdev.so 의 rte_eth_rx_burst 에 uprobe+uretprobe
- *      - 실패 시 Driver level: --pmd-lib 의 드라이버 함수에 uprobe+uretprobe
- *        (mlx5_rx_burst_*, i40e_recv_pkts, ixgbe_recv_pkts_*, ice_recv_pkts)
- *   5) TX 후킹 (Driver level 전용):
- *      - --pmd-lib 의 드라이버 TX 함수에 uprobe entry
- *        (mlx5_tx_burst_empw, i40e_xmit_pkts, ixgbe_xmit_pkts, ice_xmit_pkts)
- *      - TX는 API(rte_eth_tx_burst)가 inline 컴파일되어 심볼 없음 → 드라이버만 가능
- *   6) comm_policy.json 을 파싱해 comm_policy 맵에 주입.
- *   7) comm_events ringbuf 폴링.
- *   8) SIGUSR1 수신 시 queue_stats / lat_hist 합산해서 stderr 에 출력.
- *
- * 빌드: gcc comm_loader.c -o comm_loader -lbpf -lelf -lz
- *
- * 실행 예:
- *   # API level RX + Driver level TX (권장)
- *   sudo ./comm_loader \
- *     --bpf ./ebpf/comm_filter.bpf.o \
- *     --lib /usr/local/lib/x86_64-linux-gnu/librte_ethdev.so \
- *     --pmd-lib /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so \
- *     --offsets ./tools/offsets.json \
- *     --policy comm_policy.json \
- *     --enforcement
+ * Build: gcc comm_loader.c -o comm_loader -lbpf -lelf -lz
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -57,12 +31,12 @@
 #include "ebpf/bpftime_variant/common_cgroup.h"
 
 /* --------------------------------------------------------------------- */
-/*  드라이버 레벨 심볼 목록                                               */
+/*  Driver-level symbol lists                                            */
 /* --------------------------------------------------------------------- */
 
 /*
- * RX 드라이버 함수 심볼 목록.
- * API(rte_eth_rx_burst) 후킹 실패 시 순서대로 시도.
+ * RX driver function symbols, tried in order if API-level
+ * (rte_eth_rx_burst) hooking fails.
  * signature: uint16_t fn(void *rxq, rte_mbuf **rx_pkts, uint16_t nb_pkts)
  */
 static const char *RX_DRIVER_SYMS[] = {
@@ -74,8 +48,8 @@ static const char *RX_DRIVER_SYMS[] = {
 };
 
 /*
- * TX 드라이버 함수 심볼 목록.
- * rte_eth_tx_burst는 inline → 심볼 없음 → 항상 드라이버 레벨만 가능.
+ * TX driver function symbols. rte_eth_tx_burst is inlined (no symbol), so
+ * TX can only be hooked at driver level.
  * signature: uint16_t fn(void *txq, rte_mbuf **tx_pkts, uint16_t nb_pkts)
  */
 static const char *TX_DRIVER_SYMS[] = {
@@ -131,14 +105,13 @@ static void on_sigusr1(int s) { (void)s; dump_now = 1; }
 
 static volatile int g_prologue_tamper_sentinel_run = 1;
 
-/* ── Prologue Integrity TamperSentinel (RDNet-style process_vm_readv) ──────────
- * bpftime mode에서 악의적 테넌트가 PMD 함수 프롤로그를 복원해 후크를
- * 제거하는 공격을 탐지한다.
- * comm_loader 가 --pid <pid> 를 받으면:
- *   (1) 대상 프로세스 메모리에서 각 PMD 심볼의 런타임 주소를 계산
- *   (2) uprobe/bpftime 패치 직후의 기대 바이트를 스냅샷
- *   (3) PROLOGUE_POLL_US 마다 process_vm_readv 로 재확인
- *   (4) 불일치 → SIGKILL + 로그
+/* ── Prologue-integrity TamperSentinel (process_vm_readv based) ────────────────
+ * Detects a malicious tenant restoring a PMD function prologue to strip the
+ * hook (bpftime mode). When --pid <pid> is given:
+ *   (1) compute each PMD symbol's runtime address in the target process
+ *   (2) snapshot the expected bytes right after the uprobe/bpftime patch
+ *   (3) re-check every PROLOGUE_POLL_US via process_vm_readv
+ *   (4) on mismatch -> SIGKILL + log
  */
 #define PROLOGUE_BYTES      8
 #define PROLOGUE_POLL_US    1000   /* 1 ms */
@@ -146,17 +119,17 @@ static volatile int g_prologue_tamper_sentinel_run = 1;
 
 struct prologue_watch_entry {
     pid_t    pid;
-    uint64_t vaddr;               /* 대상 프로세스 내 런타임 가상 주소 */
+    uint64_t vaddr;               /* runtime virtual address in the target process */
     unsigned long file_off;
     char     lib_path[PATH_MAX];
     uint8_t  expected[PROLOGUE_BYTES];
     char     sym_name[64];
-    int      valid;               /* expected 스냅샷 완료 여부 */
+    int      valid;               /* expected-bytes snapshot complete */
 };
 
 static struct prologue_watch_entry g_pw[PROLOGUE_WATCH_MAX];
 static int    g_pw_count    = 0;
-static pid_t  g_target_pid  = -1;  /* --pid 로 지정된 대상 PID */
+static pid_t  g_target_pid  = -1;  /* target PID from --pid */
 
 /* Resolve the ELF load bias from the matching /proc/<pid>/maps entry.
  * Never fall back to an unrelated executable while the target still runs
@@ -207,7 +180,7 @@ static uint64_t get_aslr_base(pid_t pid, const char *lib_path)
     return base;
 }
 
-/* process_vm_readv 로 대상 프로세스의 vaddr 에서 n 바이트 읽기 */
+/* Read n bytes from the target process's vaddr via process_vm_readv. */
 static int read_prologue(pid_t pid, uint64_t vaddr, uint8_t *buf, size_t n)
 {
     struct iovec local_iov  = { buf, n };
@@ -216,10 +189,10 @@ static int read_prologue(pid_t pid, uint64_t vaddr, uint8_t *buf, size_t n)
     return (r == (ssize_t)n) ? 0 : -1;
 }
 
-/* 감시 대상 PMD 심볼 등록
- *   lib_path: 심볼이 있는 바이너리/라이브러리 경로
- *   file_off: sym_offset() 이 반환한 파일 오프셋
- *   sym_name: 로그용 심볼 이름
+/* Register a PMD symbol to watch.
+ *   lib_path: binary/library containing the symbol
+ *   file_off: file offset returned by sym_offset()
+ *   sym_name: symbol name (for logging)
  */
 static void pw_register(const char *lib_path, unsigned long file_off,
                          const char *sym_name)
@@ -282,7 +255,7 @@ static void *tamper_sentinel_prologue_thread(void *arg)
     }
     usleep(100000); /* ensure the patch bytes remain stable before snapshot */
 
-    /* 기대 바이트 스냅샷 */
+    /* Snapshot the expected bytes. */
     for (int i = 0; i < g_pw_count; i++) {
         if (!g_pw[i].vaddr) continue;
         if (read_prologue(g_pw[i].pid, g_pw[i].vaddr,
@@ -321,7 +294,7 @@ static void *tamper_sentinel_prologue_thread(void *arg)
             uint8_t cur[PROLOGUE_BYTES];
             if (read_prologue(g_pw[i].pid, g_pw[i].vaddr,
                               cur, PROLOGUE_BYTES) < 0)
-                continue;  /* 프로세스 종료 등 */
+                continue;  /* process exited, etc. */
 
             if (memcmp(cur, g_pw[i].expected, PROLOGUE_BYTES) != 0) {
                 fprintf(stderr,
@@ -357,8 +330,8 @@ static void *tamper_sentinel_prologue_thread(void *arg)
 struct options {
     const char *bpf_obj;
     const char *lib_path;       /* librte_ethdev.so (API level RX) */
-    const char *pmd_lib_path;       /* librte_net_mlx5.so 등 (Driver level RX/TX) */
-    const char *pmd_debug_lib_path; /* stripped .so의 debug 심볼 파일 (nm 전용, ASLR base는 pmd_lib_path 사용) */
+    const char *pmd_lib_path;       /* librte_net_mlx5.so etc. (driver-level RX/TX) */
+    const char *pmd_debug_lib_path; /* debug-symbol file for a stripped .so (nm only; ASLR base uses pmd_lib_path) */
     const char *policy_path;
     const char *offsets_path;
     int json;
@@ -369,9 +342,9 @@ struct options {
     int vlan_count;
     int latency_sample;
     int max_burst_inspect;
-    int no_pin;   /* --no-pin: bpftime 모드용, map pinning 비활성화 */
-    int pid;      /* --pid: 프롤로그 무결성 워치독 대상 PID (-1 = 비활성) */
-    int attach_pids[8]; /* --attach-pid: 지정한 프로세스에만 uprobe 부착 */
+    int no_pin;   /* --no-pin: disable map pinning (bpftime mode) */
+    int pid;      /* --pid: prologue-integrity watchdog target PID (-1 = disabled) */
+    int attach_pids[8]; /* --attach-pid: attach uprobe only to the given processes */
     int attach_pid_count;
 };
 static struct options G;
@@ -457,22 +430,22 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s --bpf <comm_filter.bpf.o> --lib <librte_ethdev.so>\n"
-        "          --offsets <path>     mbuf 오프셋 파일 (필수)\n"
-        "          [--pmd-lib <path>]   PMD 드라이버 라이브러리 (드라이버 레벨 후킹)\n"
-        "                               예: /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so\n"
-        "                               RX fallback 및 TX 후킹에 필요\n"
+        "          --offsets <path>     mbuf offset file (required)\n"
+        "          [--pmd-lib <path>]   PMD driver library (driver-level hooking)\n"
+        "                               e.g. /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so\n"
+        "                               needed for RX fallback and TX hooking\n"
         "          [--policy <file>] [--json] [-v]\n"
         "          [--enforcement] [--frag-drop] [--malformed-drop]\n"
         "          [--vlan-count] [--latency-sample]\n"
         "          [--max-burst-inspect N]\n"
-        "          [--no-pin]   bpftime 모드: map pinning 비활성화 (EINVAL 회피)\n"
-          "          [--pid <pid>]  프롤로그 무결성 워치독 대상 PID\n"
-          "                         (bpftime 모드에서 후크 제거 공격 탐지)\n"
-          "          [--attach-pid <pid>]  uprobe 대상 PID (반복 지정 가능)\n",
+        "          [--no-pin]   bpftime mode: disable map pinning (avoid EINVAL)\n"
+          "          [--pid <pid>]  prologue-integrity watchdog target PID\n"
+          "                         (detects hook-removal attacks in bpftime mode)\n"
+          "          [--attach-pid <pid>]  uprobe target PID (may be repeated)\n",
         prog);
 }
 
-/* ---- 오프셋 파일 ---- */
+/* ---- offset file ---- */
 struct mbuf_offsets { int buf_addr, data_off, pkt_len, data_len, all_set; };
 static int load_offsets(const char *path, struct mbuf_offsets *o)
 {
@@ -496,7 +469,7 @@ static int load_offsets(const char *path, struct mbuf_offsets *o)
     return o->all_set ? 0 : -1;
 }
 
-/* ---- 심볼 오프셋 조회 ---- */
+/* ---- symbol offset lookup ---- */
 /*
  * shared lib (.so)  : nm -D gives virtual addr == file offset (PIC, base=0)
  * PIE executable    : nm gives virtual addr ≈ file offset (LOAD base=0)
@@ -544,21 +517,19 @@ static unsigned long sym_offset(const char *lib, const char *sym)
 }
 
 
-/* ---- tail-call stub 자동 우회 ---------------------------------------
- * 일부 PMD의 *_vec RX/TX 래퍼(예: ixgbe_recv_pkts_vec)는 실제 작업을
- * 하는 내부 함수(_recv_raw_pkts_vec 등)로 jmp 하나만 하는 수바이트짜리
- * tail-call 스텁이다. 커널 uprobe는 1바이트 INT3 패치만 하므로 문제가
- * 없지만, bpftime/Frida의 유저스페이스 트램폴린 주입은 함수 자체보다
- * 큰 코드를 써야 해서 이런 초소형 함수를 후킹하면 마지막 jmp(또는
- * 바로 다음 함수 영역)가 깨져 실제 트래픽이 흐르는 순간 세그폴트가
- * 난다 (2026-09-21 l3fwd bpftime 실험에서 최초 발견: gdb core backtrace
- * + objdump로 근본원인 확인, ixgbe_recv_pkts_vec 14바이트 스텁).
+/* ---- Automatic tail-call stub bypass -------------------------------
+ * Some PMD *_vec RX/TX wrappers (e.g. ixgbe_recv_pkts_vec) are tiny
+ * tail-call stubs that only jmp to the real worker (_recv_raw_pkts_vec,
+ * etc.). A kernel uprobe patches a single INT3 byte and is fine, but
+ * bpftime/Frida userspace trampolines write more bytes than the stub is
+ * large, corrupting the trailing jmp (or the next function) and causing a
+ * segfault once real traffic flows.
  *
- * sym_size()로 심볼 크기를 얻고, STUB_MAX_SIZE 이하이면서 마지막
- * 5바이트가 근접 jmp(0xE9 rel32)이면 실제 점프 타겟 주소를 계산해서
- * 그쪽에 후킹한다. 타겟 함수도 동일한 x86-64 SysV 레지스터
- * (rdi/rsi/edx = rxq/rx_pkts/nb_pkts)로 진입하므로 BPF_UPROBE 인자
- * 추출은 그대로 유효하다.
+ * sym_size() gives the symbol size; if it is <= STUB_MAX_SIZE and the last
+ * 5 bytes are a near jmp (0xE9 rel32), compute the jump target and hook
+ * there instead. The target enters with the same x86-64 SysV registers
+ * (rdi/rsi/edx = rxq/rx_pkts/nb_pkts), so BPF_UPROBE arg extraction stays
+ * valid.
  */
 #define STUB_MAX_SIZE 32
 
@@ -588,7 +559,7 @@ static unsigned long resolve_tailcall_stub(const char *lib, unsigned long off,
     if (!ok) return off;
 
     unsigned char *tail = buf + size - 5;
-    if (tail[0] != 0xE9) return off;   /* 근접 jmp rel32 아님 */
+    if (tail[0] != 0xE9) return off;   /* not a near jmp rel32 */
 
     int32_t rel;
     memcpy(&rel, tail + 1, 4);
@@ -602,7 +573,7 @@ static unsigned long resolve_tailcall_stub(const char *lib, unsigned long off,
     return target;
 }
 
-/* ---- 정책 JSON (간소) ---- */
+/* ---- policy JSON (minimal parser) ---- */
 static int json_u64(const char *blob, const char *key, uint64_t *out)
 {
     char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -639,7 +610,7 @@ static uint32_t ip_of(const char *s)
     if (!s || !*s) return 0;
     struct in_addr a;
     if (inet_aton(s, &a) == 0) return 0;
-    return a.s_addr;  /* FIX(2026-09-18): inet_aton() already returns network byte order; removed erroneous ntohl() that flipped it to host order and broke comm_policy IP matching */
+    return a.s_addr;  /* inet_aton() already returns network byte order; no ntohl(). */
 }
 
 /* opt3: build the per-(class,probe) presence mask from the policy.
@@ -736,7 +707,7 @@ static int load_comm_policy(const char *path, int map_fd)
         json_u64(block, "proto", &proto);
         json_u64(block, "src_port", &sport);
         json_u64(block, "dst_port", &dport);
-        /* F-7: cgroup_id 파싱 — 없으면 0 (wildcard, 모든 cgroup에 적용) */
+        /* cgroup_id: 0 when absent = wildcard (applies to all cgroups) */
         json_u64(block, "cgroup_id", &cgroup_id);
         if (!strcasecmp(layer, "L1")) {
             fprintf(stderr,
@@ -807,13 +778,11 @@ static int handle_event(void *ctx, void *data, size_t sz)
         }
         return 0;
     }
-    /* PATCHED (2026-09-21, bpftime overhead debug): disabled per-event
-     * printf+fflush(stdout). Under sustained real traffic (10k cps ALLOW
-     * policy), this synchronous I/O per packet event could not keep up
-     * with the comm_events ringbuf producer rate, causing "Failed to
-     * reserve" (ringbuf full) and possibly exacerbating a bpftime-runtime
-     * crash under sustained backpressure. KILL logging below is untouched
-     * (separate fprintf(stderr,...) block, not gated by this). */
+    /* Per-event printf+fflush(stdout) is disabled: under sustained traffic
+     * the synchronous I/O per packet event can't keep up with the
+     * comm_events ringbuf producer rate, causing "Failed to reserve"
+     * (ringbuf full) and backpressure. KILL logging below is a separate
+     * fprintf(stderr) block and is unaffected. */
     static unsigned drop_event_samples;
     if (G.verbose && e->action_taken == ACT_DROP && drop_event_samples++ < 20)
         fprintf(stderr,
@@ -823,12 +792,11 @@ static int handle_event(void *ctx, void *data, size_t sz)
                 e->nb_pkts_returned, e->nb_pkts_dropped);
 
     /*
-     * bpftime에는 커널 전용 헬퍼인 bpf_send_signal()이 없어서 BPF
-     * 프로그램 안에서 직접 시그널을 보낼 수 없다 (comm_filter_bpftime.bpf.c
-     * 참고). 대신 여기 유저스페이스 loader가 comm_events로 ACT_KILL
-     * 이벤트를 받으면 대상 PID만 정확히 SIGKILL한다 (tamper_sentinel의
-     * kill(g_pw[i].pid, SIGKILL) 패턴과 동일 — cgroup 전체가 아니라
-     * 단일 프로세스만 타겟팅하므로 loader 자기 자신은 안전하다).
+     * bpftime lacks the kernel-only bpf_send_signal() helper, so the BPF
+     * program cannot signal from within. Instead, on an ACT_KILL event this
+     * userspace loader SIGKILLs exactly the target PID (same pattern as
+     * tamper_sentinel's kill(g_pw[i].pid, SIGKILL) -- a single process, not
+     * the whole cgroup, so the loader itself is safe).
      */
     if (e->action_taken == ACT_KILL) {
         if (G.attach_pid_count) {
@@ -862,7 +830,7 @@ static int handle_event(void *ctx, void *data, size_t sz)
     return 0;
 }
 
-/* ---- 통계 덤프 ---- */
+/* ---- stats dump ---- */
 static int ncpus(void) { int n = get_nprocs_conf(); return n > 0 ? n : 1; }
 static void dump_queue_stats(int fd)
 {
@@ -955,7 +923,7 @@ static void dump_latency_named(int fd, const char *label)
 
 static void dump_latency(int fd) { dump_latency_named(fd, "rx_latency"); }
 
-/* 이전 실행에서 남은 pinned BPF 맵을 자동 삭제 */
+/* Remove pinned BPF maps left over from a previous run. */
 static void purge_pinned_maps(struct bpf_object *obj)
 {
     (void)obj;
@@ -1062,7 +1030,7 @@ int main(int argc, char **argv)
     }
     if (!G.no_pin) mkdir(PIN_BASE, 0755);
 
-    /* 1) mbuf 오프셋 로드 */
+    /* 1) load mbuf offsets */
     struct mbuf_offsets mo;
     if (load_offsets(G.offsets_path, &mo) < 0) {
         fprintf(stderr,
@@ -1108,7 +1076,7 @@ int main(int argc, char **argv)
     /* 2) BPF open */
     struct bpf_object *obj = bpf_object__open_file(G.bpf_obj, NULL);
     if (!obj) { perror("open"); return 1; }
-    if (!G.no_pin) purge_pinned_maps(obj);  /* 이전 핀 자동 정리 */
+    if (!G.no_pin) purge_pinned_maps(obj);  /* clean stale pins */
 
     /* The host must inject a nonzero identity into .rodata before loading. */
     struct bpf_map *rodata = find_rodata_map(obj);
@@ -1146,14 +1114,14 @@ int main(int argc, char **argv)
     }
 
     /* 4) load */
-    /* bpftime --no-pin 모드: LIBBPF_PIN_BY_NAME이 설정된 맵의 pin 경로를
-     * 해제해서 BPF_OBJ_GET syscall을 막는다. bpftime SYSCALL_SERVER가
-     * BPF_OBJ_GET을 EINVAL로 처리하기 때문. */
+    /* bpftime --no-pin mode: avoid the BPF_OBJ_GET syscall on
+     * LIBBPF_PIN_BY_NAME maps, which bpftime's SYSCALL_SERVER returns
+     * EINVAL for. */
     if (G.no_pin) {
-        /* bpftime 모드: map pinning 비활성화.
-         * bpf_map__next(NULL, obj) 는 일부 libbpf 버전에서 crash 발생.
-         * 핀 경로 삭제 루프 대신, load 후 bpf_object__pin_maps 를 호출하지
-         * 않는 것으로 충분하다 (아래 if (!G.no_pin) 가드로 이미 처리). */
+        /* Map pinning disabled. bpf_map__next(NULL, obj) crashes on some
+         * libbpf versions, so instead of a pin-clearing loop we just skip
+         * bpf_object__pin_maps after load (already handled by the
+         * if (!G.no_pin) guard below). */
         fprintf(stderr, "[comm] --no-pin: map pinning disabled (bpftime mode)\n");
     }
     if (bpf_object__load(obj)) {
@@ -1168,11 +1136,11 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    if (!G.no_pin) bpf_object__pin_maps(obj, PIN_BASE);  /* load 후 pin */
+    if (!G.no_pin) bpf_object__pin_maps(obj, PIN_BASE);  /* pin after load */
 
     /* ================================================================= */
-    /*  5) RX 후킹                                                        */
-    /*     전략: API level 시도 → 실패 시 드라이버 레벨 fallback          */
+    /*  5) RX hooking                                                     */
+    /*     strategy: try API level, fall back to driver level on failure  */
     /* ================================================================= */
     int rx_attached = 0;
 
@@ -1200,7 +1168,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* --- 5b) Driver level fallback (--pmd-lib 필요) --- */
+    /* --- 5b) driver-level fallback (needs --pmd-lib) --- */
     if (!rx_attached || G.pmd_lib_path) {
         if (!G.pmd_lib_path) {
             fprintf(stderr,
@@ -1234,7 +1202,7 @@ int main(int argc, char **argv)
                         fprintf(stderr,
                             "[comm] RX attached at DRIVER level: %s @ %s (offset=0x%lx)\n",
                             RX_DRIVER_SYMS[i], G.pmd_lib_path, off);
-                        /* 프롤로그 무결성 워치독 등록 */
+                        /* register prologue-integrity watchdog */
                         pw_register(G.pmd_lib_path, off, RX_DRIVER_SYMS[i]);
 
                     } else if (G.verbose)
@@ -1252,9 +1220,9 @@ int main(int argc, char **argv)
     }
 
     /* ================================================================= */
-    /*  6) TX 후킹 (드라이버 레벨 전용)                                   */
-    /*     rte_eth_tx_burst는 TX hot-path 최적화로 거의 항상 inline →      */
-    /*     심볼 없음 → 드라이버 함수에만 후킹 가능                         */
+    /*  6) TX hooking (driver level only)                                 */
+    /*     rte_eth_tx_burst is almost always inlined (hot path), so no     */
+    /*     symbol exists; only the driver function can be hooked           */
     /* ================================================================= */
     int tx_attached = 0;
 
@@ -1286,9 +1254,9 @@ int main(int argc, char **argv)
                     fprintf(stderr,
                         "[comm] TX attached at DRIVER level: %s @ %s (offset=0x%lx)\n",
                         TX_DRIVER_SYMS[i], G.pmd_lib_path, off);
-                    /* 프롤로그 무결성 워치독 등록 */
+                    /* register prologue-integrity watchdog */
                     pw_register(G.pmd_lib_path, off, TX_DRIVER_SYMS[i]);
-                    /* latency sampling용 TX uretprobe 추가 */
+                    /* add TX uretprobe for latency sampling */
                     struct bpf_program *p_tx_ret = getenv("ESAC_TX_NO_URET") ? NULL :
                         bpf_object__find_program_by_name(obj, "uretprobe_tx_burst");
                     if (p_tx_ret) {
@@ -1316,7 +1284,7 @@ int main(int argc, char **argv)
         tx_attached ? "OK" : "NONE");
 
     /* ================================================================= */
-    /*  7) 정책 주입                                                       */
+    /*  7) policy injection                                               */
     /* ================================================================= */
     int pol_fd = bpf_object__find_map_fd_by_name(obj, "comm_policy");
     g_pol_fd = pol_fd;
@@ -1327,7 +1295,7 @@ int main(int argc, char **argv)
     int lat_fd     = bpf_object__find_map_fd_by_name(obj, "lat_hist");
     int lat_tx_fd  = bpf_object__find_map_fd_by_name(obj, "lat_hist_tx");
 
-    /* PMD 프롤로그 무결성 (process_vm_readv, RDNet-style) */
+    /* PMD prologue integrity (process_vm_readv) */
     if (g_target_pid > 0) {
         pthread_t pw_tid;
         if (pthread_create(&pw_tid, NULL, tamper_sentinel_prologue_thread, NULL) == 0)
@@ -1337,7 +1305,7 @@ int main(int argc, char **argv)
     }
 
     /* ================================================================= */
-    /*  8) ringbuf 폴링                                                    */
+    /*  8) ringbuf polling                                                */
     /* ================================================================= */
     int ev_fd = bpf_object__find_map_fd_by_name(obj, "comm_events");
     struct ring_buffer *rb = ring_buffer__new(ev_fd, handle_event, NULL, NULL);

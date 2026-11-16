@@ -1,15 +1,7 @@
 /*
- * comm_filter.bpf.c  ── NO-BTF edition
- * Phase 2 - 통신 접근 제어 (Layer 2: rxburst / txburst 후킹)
- *
- * libbpf 0.5.0 + kernel 6.8 호환
- *   · bpf_core_read.h 제거 (CO-RE 없음)
- *   · F-6 수정: #define 상수 → const volatile struct runtime_config RCFG
- *               로더가 .rodata 에 mbuf 오프셋 등을 런타임 주입
- *   · __type() 전부 → __uint(key_size/value_size, sizeof(...))
- *   · RINGBUF → PERF_EVENT_ARRAY
- *   · emit_comm() → bpf_perf_event_output
- *   · cgroup mode: host-injected ID is selected outside the packet path
+ * L4 policy filter + L7 Hyperscan gate for DPDK rx/tx burst hooks (no-BTF).
+ * Per-tenant policy keyed by host-injected cgroup_id; the loader injects
+ * mbuf offsets and config into RCFG (.rodata) at load time.
  */
 #include "common_cgroup.h"
 #include <bpf/bpf_helpers.h>
@@ -20,24 +12,24 @@
 char LICENSE[] SEC("license") = "GPL";
 
 /*
- * F-6: Runtime config (.rodata 섹션, 로더가 로드 전에 값 주입)
- *   mbuf_off_* : tools/discover_offsets 가 실측한 rte_mbuf 필드 오프셋
- *   default 값은 일반 DPDK 빌드 기준 (로더 미연결 시 fallback)
+ * Runtime config in .rodata; loader injects values before load.
+ *   mbuf_off_* : measured rte_mbuf field offsets (tools/discover_offsets)
+ *   defaults are generic-DPDK fallbacks used if the loader doesn't inject.
  */
 const volatile struct runtime_config RCFG = {
-    .mbuf_off_buf_addr = 0,    /* 실제 오프셋은 로더가 주입          */
+    .mbuf_off_buf_addr = 0,    /* real offset injected by loader */
     .mbuf_off_data_off = 16,
     .mbuf_off_pkt_len  = 36,
     .mbuf_off_data_len = 40,
-    .max_burst_inspect = 128,   /* F-1 수정: burst 32개 전부 검사      */
+    .max_burst_inspect = 128,   /* inspect all packets in a burst */
     .kill_signal       = 9,
     .enabled           = 1,
     .generation        = 0,
-    .features          = FEAT_ENFORCEMENT | FEAT_LATENCY_SAMPLE,  /* 기본: 강제집행 활성화 */
+    .features          = FEAT_ENFORCEMENT | FEAT_LATENCY_SAMPLE,  /* default: enforcement on */
     .tenant_cgroup_id  = 0,    /* loader must inject a nonzero host ID */
 };
 
-/* ── Maps (BTF 없이 raw size) ─────────────────────────────────────── */
+/* Maps (raw key/value sizes, no BTF) */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
@@ -56,7 +48,7 @@ struct {
     __uint(max_entries, 1024 * 1024);
 } comm_events SEC(".maps");
 
-/* uprobe→uretprobe 인자 보관 (API-level RX), key = tid */
+/* uprobe→uretprobe arg save (API-level RX), key = tid */
 struct rxburst_args {
     __u64 rx_pkts_ptr;
     __u64 ts_entry;
@@ -72,12 +64,11 @@ struct {
     __uint(value_size, sizeof(struct rxburst_args));
 } rxburst_pending SEC(".maps");
 
-/* uprobe→uretprobe 인자 보관 (Driver-level RX).
- * OPT(mcopt): was BPF_MAP_TYPE_HASH keyed by tid, which serialized every
- * per-burst access on the map's exclusive spinlock across all lcore worker
- * threads. Since each thread only touches its own entry (enter→leave paired,
- * non-nested), a PERCPU_ARRAY[1] gives per-CPU lock-free storage. A `valid`
- * flag replaces the old delete() to keep the "no matching enter" guard. */
+/* uprobe→uretprobe arg save (Driver-level RX).
+ * PERCPU_ARRAY[1], not HASH-by-tid: each thread touches only its own entry
+ * (enter→leave paired, non-nested), so per-CPU storage is lock-free and
+ * avoids the map spinlock. The `valid` flag replaces delete() as the
+ * "no matching enter" guard (per-CPU arrays have no delete). */
 struct rxburst_drv_args {
     __u64 rx_pkts_ptr;
     __u64 ts_entry;
@@ -101,7 +92,7 @@ struct {
     __uint(value_size, sizeof(struct queue_stats));
 } queue_stats SEC(".maps");
 
-/* RX 지연 히스토그램 (PERCPU) */
+/* RX latency histogram (per-CPU) */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -109,7 +100,7 @@ struct {
     __uint(value_size, sizeof(struct latency_hist));
 } lat_hist SEC(".maps");
 
-/* TX 지연 히스토그램 (PERCPU) */
+/* TX latency histogram (per-CPU) */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -117,15 +108,14 @@ struct {
     __uint(value_size, sizeof(struct latency_hist));
 } lat_hist_tx SEC(".maps");
 
-/* 취약성 이벤트 (RX starvation, TX drop, malformed mbuf) */
+/* vulnerability events (RX starvation, TX drop, malformed mbuf) */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1024 * 1024);
 } vuln_events SEC(".maps");
 
-/* TX burst 인자 보관 (uretprobe에서 drop 탐지).
- * OPT(mcopt): HASH(key=tid) → PERCPU_ARRAY[1], same rationale as
- * rxburst_drv_pending — removes the per-burst exclusive-spinlock contention. */
+/* TX burst arg save (uretprobe uses it for drop detection).
+ * PERCPU_ARRAY[1], not HASH-by-tid, same rationale as rxburst_drv_pending. */
 struct txburst_drv_args {
     __u16 nb_pkts;
     __u8  valid;
@@ -346,7 +336,7 @@ emit_comm(void *ctx,
     bpf_ringbuf_output(&comm_events, &e, sizeof(e), 0);
 }
 
-/* mbuf pkt_len/data_len → 0 (enforcement 비활성 시 no-op) */
+/* zero mbuf pkt_len/data_len to drop a packet (no-op when enforcement off) */
 static __always_inline void
 emit_vuln(void *ctx,
           __u32 pid, __u32 tgid, __u64 cgroup_id,
@@ -378,18 +368,12 @@ nullify_mbuf(__u64 mbuf_ptr)
 }
 
 
-/* ── bpf_loop: per-packet context & callback ────────────────────── */
-/*
- * VERIFIER FIX: counter fields removed from pkt_iter_ctx.
- * Accumulating packet counters on the BPF stack
- * across bpf_loop iterations creates distinct concrete register-state
- * variants that the verifier must re-explore for each iteration, causing
- * state explosion (>1M insns).  Instead, each pkt_cb invocation does its
- * own bpf_map_lookup_elem(&queue_stats, &c->qstats_key) and writes
- * counters directly to the resulting map_value.  Map-value writes produce
- * only "unknown" (mmmm) verifier states that dedup immediately, so the
- * loop converges in O(#distinct actions) ≈ 2 iterations.
- */
+/* bpf_loop: per-packet context & callback.
+ * Gotcha: counters are NOT kept on the ctx stack across iterations -- that
+ * creates distinct concrete register states the verifier re-explores per
+ * iteration (state explosion >1M insns). Instead counters are written
+ * directly to the queue_stats map_value, which dedups to "unknown" states
+ * and lets the loop converge in ~2 iterations. */
 struct pkt_scratch {
     /* Batched pre-fetch of one burst's mbuf pointer array. Lives in a
      * per-thread map slot (NOT on the stack) because embedding a 256-byte
@@ -402,9 +386,8 @@ struct pkt_scratch {
     __u64 dropped_ptrs[128];
 };
 
-/* OPT(mcopt): HASH(key=tid) → PERCPU_ARRAY[1]. Each lcore thread only ever
- * touched its own tid slot (see comment above), so per-CPU storage is exact
- * and removes the exclusive-spinlock acquisition on every burst. */
+/* PERCPU_ARRAY[1], not HASH-by-tid: each lcore thread touches only its own
+ * slot, so per-CPU storage is exact and avoids the per-burst map spinlock. */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -416,7 +399,7 @@ struct {
  * without needing a 256-byte zero-initializer on the stack. */
 static const struct pkt_scratch g_zero_scratch;
 
-/* --- L7 BATCH (완성형): per-burst HS scratch; pkt_prescan content-gates then fills it --- */
+/* L7 batch: per-burst Hyperscan scratch; pkt_prescan content-gates then fills it */
 struct hs_batch_item { __u64 pl_ptr; __u32 pl_len; __u32 act; };
 struct hs_batch { struct hs_batch_item item[128]; };
 struct {
@@ -518,7 +501,7 @@ static __noinline int pkt_prescan(__u32 idx, void *arg)
             __u64 pl_ptr = data_ptr + payload_off;
             __u32 pl_len = pkt_len - payload_off;
             if (pl_len > 1460) pl_len = 1460;
-            /* 완성형 CONTENT CANDIDATE GATE: only DNS(qd==1)/TLS-CH/HTTP shapes go to the provider. */
+            /* content candidate gate: only DNS(qd==1)/TLS-ClientHello/HTTP shapes go to the ufunc */
             unsigned char pl12[12];
             int cand = 0;
             if (pl_len >= 12 && read_user(pl12, (void *)(unsigned long)pl_ptr, 12) == 0) {
@@ -545,17 +528,9 @@ static __noinline int pkt_cb(__u32 idx, void *arg)
     if (idx >= 32) return 1;   /* compile-time-provable bound for the
                                  * c->mbuf_scratch->mbuf_ptrs[idx] access */
 
-    /* Look up queue_stats locally so counter writes go to a map_value
-     * (not the ctx stack).  The verifier marks map_value bytes "unknown"
-     * after the first write and deduplicates state immediately, eliminating
-     * per-iteration state explosion.  NULL check below guards every use. */
-    /* queue_stats pointer is now hoisted to parse_and_apply() (done
-     * ONCE per burst there, since c->qstats_key is constant across all
-     * packets in the burst) and passed through via c->qs -- this
-     * eliminates up to 32 redundant bpf_map_lookup_elem() calls per
-     * burst that used to happen here (one per packet, always returning
-     * the exact same map_value pointer). NULL check below still guards
-     * every use, same as before. */
+    /* queue_stats pointer is looked up once per burst in parse_and_apply()
+     * (qstats_key is constant across the burst) and passed in via c->qs,
+     * avoiding a redundant lookup per packet. NULL check below guards use. */
     struct queue_stats *qs = c->qs;
 
     __u64 mbuf_ptr = 0;
@@ -752,7 +727,7 @@ packet_done:
     return 0;
 }
 
-/* 출력 인자를 구조체로 묶어 BPF __noinline 5-arg 제한 우회 */
+/* Pack outputs in a struct to stay under the BPF __noinline 5-arg limit. */
 struct parse_result {
     __u32 sip;
     __u32 dip;
@@ -806,18 +781,14 @@ parse_and_apply(__u64 ptr_base, __u16 n, __u64 cgroup_id,
     __u64 drop_before = qs ? qs->drop : 0;
     ctx.qs = qs;  /* let pkt_cb() reuse this instead of re-looking-up */
 
-    /* bpftime has no bpf_loop() helper -- unroll a bounded loop instead.
-     * pkt_cb()'s own `if (idx >= c->n) return 1;` guard makes this safe
-     * for any n <= 32 (matches the kernel path's bpf_loop(32, pkt_cb, ...)
-     * cap, so both paths inspect the same up-to-32 packets per burst). */
-    /* Manually unrolled -- #pragma unroll / #pragma clang loop
-     * unroll(full) both failed to actually unroll this loop on
-     * this toolchain (build warning: loop not unrolled), leaving
-     * a real backward-branch loop that bpftime's verifier could
-     * not load. A literal unrolled sequence has no backward
-     * branch at all, sidestepping the issue entirely. */
+    /* bpftime has no bpf_loop() helper, so this loop is manually unrolled.
+     * pkt_cb()'s own `if (idx >= c->n) return 1;` guard bounds it. A literal
+     * unrolled sequence has no backward branch -- #pragma unroll did not
+     * take on this toolchain and bpftime's verifier cannot load a real
+     * backward-branch loop. */
     {
-        /* L7 BATCH (완성형): content-gate prescan; call ufunc ONLY if a candidate exists */
+        /* L7 batch: content-gate prescan, then call the Hyperscan ufunc once
+         * per burst only if the prescan found at least one candidate */
         {
             __u32 bz = 0;
             struct hs_batch *hb = bpf_map_lookup_elem(&hs_batch_map, &bz);
@@ -1035,11 +1006,8 @@ int BPF_URETPROBE(uretprobe_rx_burst, unsigned short ret)
 
     __u16 drops = parse_and_apply(a->rx_pkts_ptr, n, cg_id, qs, &pr);
 
-    /* NOTE (fixed): this used to double-count into qs->tx, which the
-     * TX driver uprobe (uprobe_tx_burst_drv) already increments for
-     * real outgoing bursts (qs->tx += nb_pkts). RX-side packets that
-     * pass inspection are not re-added here anymore -- qs->tx now
-     * reflects only actual TX-hook traffic, no RX contribution. */
+    /* qs->tx counts only real TX-hook traffic; RX-passed packets are not
+     * added here (the TX driver uprobe already increments qs->tx). */
 
     if (drops || pr.worst != ACT_ALLOW)
         emit_comm(ctx, pid_hi, 0, cg_id, a->port_id, a->queue_id,
@@ -1053,17 +1021,12 @@ int BPF_URETPROBE(uretprobe_rx_burst, unsigned short ret)
 }
 #endif  /* API-level RX disabled */
 
-/* ── [Driver level] uprobe: RX driver (entry) ───────────────────── */
-#if 1  /* RX driver-level uprobe enabled. Historical disable note follows.
- * DPDK busy-polls rx_burst at ~300k+ calls/sec even with zero traffic (empty
- * polls). Under sustained load this uprobe/uretprobe pair fires millions of
- * times, and bpftime/Frida's userspace interception cannot sustain this
- * invocation rate without crashing deep in its own runtime (confirmed via
- * gdb core analysis: SIGSEGV in anonymous JIT-generated memory, independent
- * of target binary, independent of core count, independent of ringbuf
- * pressure -- narrowed down to raw uprobe call frequency itself). TX-side
- * enforcement (below) is kept active since TX is called far less often
- * (roughly once per actual outgoing burst, not per idle poll). */
+/* [Driver level] uprobe: RX driver (entry).
+ * Gotcha: DPDK busy-polls rx_burst (~300k+ calls/sec even with zero traffic),
+ * and bpftime/Frida userspace interception can SIGSEGV in its JIT runtime at
+ * that uprobe rate. TX is hooked instead when needed since it fires far less
+ * often (roughly once per outgoing burst, not per idle poll). */
+#if 1  /* RX driver-level uprobe enabled */
 SEC("uprobe/rx_burst_drv")
 int BPF_UPROBE(uprobe_rx_burst_drv,
                void *rxq,
@@ -1099,10 +1062,10 @@ int BPF_URETPROBE(uretprobe_rx_burst_drv, unsigned short ret)
     struct parse_result pr = {};
 
     if (n == 0) {
-        /* RX starvation 감지: zero-return burst */
+        /* RX starvation: zero-return burst */
         if (qs) {
             qs->rx_zero_burst++;
-            /* 연속 100회 이상이면 vuln_event 방출 */
+            /* emit a vuln_event periodically while zero bursts persist */
             if ((qs->rx_zero_burst % 10000000) == 0)
                 emit_vuln(ctx, pid_hi, 0, cg_id, 0, 0,
                           VULN_RX_STARVATION, (__u32)qs->rx_zero_burst);
@@ -1148,11 +1111,8 @@ int BPF_URETPROBE(uretprobe_rx_burst_drv, unsigned short ret)
     }
 
 
-    /* NOTE (fixed): this used to double-count into qs->tx, which the
-     * TX driver uprobe (uprobe_tx_burst_drv) already increments for
-     * real outgoing bursts (qs->tx += nb_pkts). RX-side packets that
-     * pass inspection are not re-added here anymore -- qs->tx now
-     * reflects only actual TX-hook traffic, no RX contribution. */
+    /* qs->tx counts only real TX-hook traffic; RX-passed packets are not
+     * added here (the TX driver uprobe already increments qs->tx). */
 
     if (drops || pr.worst != ACT_ALLOW)
         emit_comm(ctx, pid_hi, 0, cg_id, 0, 0,
@@ -1197,7 +1157,7 @@ int BPF_UPROBE(uprobe_tx_burst,
                   pr.sip, pr.dip, pr.sp, pr.dp,
                    pr.proto, (__u8)pr.worst, 2);
 
-    /* TX pending 저장: uretprobe에서 drop 탐지에 사용 */
+    /* save TX pending; uretprobe uses it to detect drops */
     __u32 z2 = 0;                      /* OPT(mcopt): PERCPU_ARRAY slot 0 */
     struct txburst_drv_args ta = {};
     ta.nb_pkts  = nb_pkts;
@@ -1208,7 +1168,7 @@ int BPF_UPROBE(uprobe_tx_burst,
     return 0;
 }
 
-/* ── [Driver level] uretprobe: TX driver (exit) — TX drop 탐지 ──── */
+/* [Driver level] uretprobe: TX driver (exit) — TX drop detection */
 SEC("uretprobe/tx_burst_drv")
 int BPF_URETPROBE(uretprobe_tx_burst, unsigned short ret)
 {
