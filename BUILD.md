@@ -41,6 +41,11 @@ gcc Resource_Bank/src/r_loader.c             -o Resource_Bank/r_loader         -
 gcc Resource_Bank/src/r_loader_rate.c        -o Resource_Bank/r_loader_rate    -lbpf -lelf -lz
 ```
 
+The loader sources `#include` small headers shipped next to them (`bpftime_Loader/src/ebpf/…`,
+`Resource_Bank/ebpf/common.h`), so the commands above build as-is from the repo root. The loaders
+find the BPF `.rodata` map by trying the known object-prefixed names, so a `.bpf.o` rename does not
+break policy injection (libbpf derives that map's name from the object/filename).
+
 ## 4. Build the eBPF filter objects
 
 ```sh

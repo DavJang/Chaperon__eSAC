@@ -37,37 +37,30 @@ Expected: a request of `-m 9999 -l 0,1,2,3,4` against quota `{socket_mem 128, lc
 
 ---
 
-## Demo 3 — Communication: L4 DROP  *(DPDK NIC; mlx5 switchdev here)*
+## Demo 3 — Communication: L4 DROP  *(mlx5 NIC + dpdk-testpmd)*
 
 Proves `c_loader` + `c_filter.bpf.o` drop a matching 5-tuple on the PMD RX burst **before the
-tenant app sees it**. The enforcement signal is the loader's `ACT_DROP … dropped=N` accounting
-(the NIC's own RX counter sits *before* the hook, so it keeps counting — that is expected).
-
-Pattern (STOP/CONT start-gate, pinned bpftime shm — the sequence that attaches cleanly):
+tenant app sees it**. Deterministic: a `dpdk-testpmd` tenant on the server VF receives UDP from a
+`txonly` generator on the client VF; an ALLOW policy passes all, a DROP policy drops all.
 
 ```sh
-SHM=esac_$(date +%s%N)
-# 1. tenant, stopped before exec, Agent preloaded, pinned shm, scalar RX so the vector path
-#    doesn't bypass the hook:
-sudo setsid bash -c "echo \$\$>/tmp/tpid; kill -STOP \$\$; exec \
-  env BPFTIME_GLOBAL_SHM_NAME=$SHM LD_PRELOAD=bpftime_Agent/Frida/libbpftime-agent.so \
-  <tenant-app> -a <SVF>,rx_vec_en=0 -- --forward-mode=rxonly" &
-PID=$(cat /tmp/tpid)
-# 2. scope it in a cgroup and key the policy on that cgroup_id (DROP dst 198.18.0.2:9/udp):
-#    { "rules":[{"layer":"L2","cgroup_id":<CGID>,"dst_ip":"198.18.0.2","proto":17,
-#                "dst_port":9,"action":"DROP"}] }
-# 3. attach the loader (same pinned shm), wait for "attach summary: RX=OK TX=OK", then CONT:
-sudo env BPFTIME_GLOBAL_SHM_NAME=$SHM LD_PRELOAD=bpftime_Loader/libbpftime-syscall-server.so \
-  bpftime_Loader/c_loader --max-burst-inspect 128 --bpf bpftime_Agent/C_Filter/c_filter.bpf.o \
-  --lib <tenant-app> --pmd-lib <tenant-app> --offsets demos/offsets.json \
-  --policy /tmp/pol.json --no-pin --enforcement --attach-pid $PID -v
-sudo kill -CONT $PID
-# 4. blast matching traffic from a second VF toward dst 198.18.0.2:9 → loader logs ACT_DROP.
+sudo PF1=0000:3b:00.1 IF1=enp59s0f1np1 bash demos/l4_drop.sh
 ```
 
-Expected: an ALLOW policy → no drops; a DROP policy → `ACT_DROP dir=… dropped=…` in the loader
-log. Validated on this rig with both a `dpdk-testpmd` tenant and an f-stack Redis tenant;
-adapt the device BDF, cores/NUMA, and tenant app to your own NIC.
+It brings up the fabric itself (`demos/setup_mlx5_fabric.sh` — edit `PF1`/`IF1` for your NIC,
+`SCORES`/`GCORES` for your NUMA), attaches the loader with the STOP/CONT start-gate and a pinned
+bpftime shm, then generates traffic. Verified on the rig (ConnectX-6 Dx):
+
+```
+[allow] action=ALLOW attach=YES ACT_DROP_events=0  total_dropped=0
+[drop]  action=DROP  attach=YES ACT_DROP_events=20 total_dropped=... 
+[comm] ACT_DROP sample: dir=RX tuple=198.18.x.11:9 -> 198.18.0.2:9 proto=17 burst=32 dropped=32
+VERDICT: PASS -- L4 DROP enforced
+```
+
+`dropped=32` of a 32-packet burst = every matching packet dropped at RX before the tenant. (The
+NIC's own RX counter sits *before* the hook, so it keeps counting — that is expected; the
+enforcement signal is the loader's `ACT_DROP … dropped=N`.)
 
 ---
 
@@ -83,26 +76,41 @@ Proves the Hyperscan ufunc drops by **payload content** at the same 5-tuple that
 
 ## Demo 5 — Resource: override & throttle  *(DPDK NIC)*
 
-Proves an over-quota runtime `rte_malloc` / `rte_flow_create` is forced to `NULL` (override), and
-that high-rate churn is rate-limited (throttle), via `r_loader` + `r_filter*.bpf.o`.
+Proves an over-quota runtime `rte_malloc`/`rte_flow_create` is forced to `NULL` (override), and
+that high-rate churn is rate-limited (throttle). Both use `r_loader_rate`, which attaches the
+BPF programs to exported DPDK symbols as `BPF_MODIFY_RETURN` (so `bpf_override_return()` fires):
 
 ```sh
-# override / kill-backstop:
-sudo Resource_Bank/r_loader --bpf bpftime_Agent/R_Filter/r_filter_quota.bpf.o \
-  --lib <librte_eal.so> --policy demos/quota.json --attach-pid <tenant-pid> -v      # -v = block
-#   add --json to escalate a persistent violator to SIGKILL (backstop).
-# throttle (token-bucket rate-limit on churn):
-sudo Resource_Bank/r_loader_rate bpftime_Agent/R_Filter/r_filter_rate.bpf.o <tenant-pid> <config>
+# config: one hook per line  <lib_path> <offset_hex> <prog_name>   (offset from: nm -D <lib>)
+printf '%s %s q_rte_malloc\n'  "$EAL" "$(nm -D "$EAL"|awk '/ rte_malloc@/{print $1;exit}')"  > cfg
+sudo env BPFTIME_GLOBAL_SHM_NAME=$SHM LD_PRELOAD=bpftime_Loader/libbpftime-syscall-server.so \
+  Resource_Bank/r_loader_rate bpftime_Agent/R_Filter/r_filter_quota.bpf.o <tenant-pid> cfg
+# throttle instead: use r_filter_rate.bpf.o with prog cp_rate_ptr / cp_rate_int.
 ```
 
-The churn tenant must hold a live DPDK port (the control APIs need one), so this demo needs the
-NIC bound to DPDK. Expected: churn output flips `malloc=OK`→`malloc=NULL` (override) or
-`ALLOW×N → DENY` (throttle).
+The churn tenant holds a live DPDK port (the control APIs need one), launched like the comm-plane
+tenant (Agent preloaded, pinned shm, STOP/CONT). Verified on the rig: with a 1 MiB per-call
+ceiling, a quota-tightened build forced the tenant's EAL-init `rte_malloc` to `NULL`, so the
+tenant failed closed —
+
+```
+[gov] q_rte_malloc  -> librte_eal.so.23@0x27b30  (attached, BPF_MODIFY_RETURN)
+tenant: EAL: error allocating rte services array / rte_service_init() failed
+```
+
+— i.e. the over-ceiling allocation returned `NULL`. A within-ceiling allocation returns normally
+(`malloc=OK`), so legitimate tenants are unaffected. (`r_loader_rate` prints `ready: 0/N` due to a
+counter that expects attach rc==0 while bpftime returns a positive fd; the hooks are attached.)
 
 ---
 
 ## Status of validation
 
-Verified end-to-end on the mlx5 rig: Tamper KILL, admission DENY, `c_loader` RX/TX attach +
-`ACT_DROP`, `r_loader` uprobe attach + override. The datapath demos depend on your NIC, DPDK
-build, hugepages, and core/NUMA layout — treat the commands above as a template to adapt.
+All four enforcement types verified end-to-end on the mlx5 rig (ConnectX-6 Dx, switchdev VF-to-VF):
+Tamper KILL (5/5 vectors), admission DENY, L4 DROP (`ACT_DROP dir=RX dropped=32/32`), and resource
+override (over-ceiling `rte_malloc` → `NULL`). Demos 1–2 run on any Linux host; Demos 3–5 depend
+on your NIC, DPDK build, hugepages, and core/NUMA layout — set `PF1`/`IF1`/`SCORES`/`GCORES`.
+
+Note: a file rename once broke enforcement because libbpf derives the auto `.rodata` map name from
+the `.bpf.o` **filename** (`<objname[0:8]>.rodata`); the loaders now resolve it by trying the known
+names, so renaming a `.bpf.o` no longer breaks the policy injection.

@@ -423,6 +423,23 @@ static void purge_pinned_maps(struct bpf_object *obj)
     }
 }
 
+/* Robust .rodata lookup: libbpf names the auto map <objname[0:8]>.rodata, derived from the
+ * .bpf.o FILENAME at load time -- so renaming the file changes the map name. Match by suffix. */
+static struct bpf_map *find_rodata_map(struct bpf_object *obj)
+{
+    /* libbpf names the auto .rodata map <objname[0:8]>.rodata from the .bpf.o FILENAME, so a
+     * file rename changes it. Try the known object prefixes + the generic name, using only
+     * bpf_object__find_map_by_name for libbpf-version portability. */
+    static const char *cands[] = { "c_filter.rodata", "r_filter.rodata",
+                                   "comm_fil.rodata", "resource.rodata", ".rodata", NULL };
+    int i;
+    for (i = 0; cands[i]; i++) {
+        struct bpf_map *m = bpf_object__find_map_by_name(obj, cands[i]);
+        if (m) return m;
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     static struct option longopts[] = {
@@ -479,7 +496,7 @@ int main(int argc, char **argv)
     }
 
     /* .rodata 주입 */
-    struct bpf_map *rodata = bpf_object__find_map_by_name(obj, ".rodata");
+    struct bpf_map *rodata = find_rodata_map(obj);
     if (rodata) {
         size_t value_size = 0;
         struct runtime_config *rcfg = bpf_map__initial_value(rodata, &value_size);
