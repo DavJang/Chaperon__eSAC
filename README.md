@@ -65,8 +65,8 @@ eSAC's concern — it guards only the **PF-shared NIC** and **host** resources S
 ## What is prebuilt here vs. built by you
 
 Shipped prebuilt (small, but linked for the validation rig's DPDK — rebuild for your own):
-`c_loader`, `c_loader_tx`, `r_loader`, `r_loader_rate`, the `*.bpf.o` eBPF objects,
-`ufunc/esac_hs_ufunc.so`. **Not shipped** (build per BUILD.md): the bpftime runtime
+`c_loader`, `c_loader_rx` (RX-only datapath loader), `c_loader_tx`, `r_loader`, `r_loader_rate`, the `*.bpf.o` eBPF objects,
+`ufunc/esac_hs_ufunc.so`, and the L7 Hyperscan-DB builders `ufunc/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. **Not shipped** (build per BUILD.md): the bpftime runtime
 (`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled
 Tamper-Sentinel C++ binaries (the canonical sentinel is the bpftrace script
 `Tamper_Sentinel/tamper_sentinel_event.sh`, which needs no build).

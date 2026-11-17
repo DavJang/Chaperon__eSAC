@@ -8,6 +8,22 @@ Run everything from the repo root. Root is required (bpftrace, uprobe attach, hu
 
 ---
 
+## L7 prerequisite — build the Hyperscan match DB  *(before any L7 enforcement)*
+
+The L7 ufunc reads two read-only match DBs from shared memory. Materialize them once
+(after building the `hsdb_ctl` tools, BUILD.md §5b):
+
+```sh
+# domain-list DB (empty baseline shown; swap /dev/null for your allow/deny list)
+./bpftime_Agent/ufunc/hsdb_ctl/esac_dom_ctl_bulk /esac_dom_db /dev/null none
+# Hyperscan pattern DB from the shipped Suricata DNS ruleset
+./bpftime_Agent/ufunc/hsdb_ctl/esac_hs_ctl_rx   /esac_hs_db \
+    bpftime_Agent/ufunc/patterns/suricata_dns_patterns.txt none
+# -> creates /dev/shm/esac_hs_db and /dev/shm/esac_dom_db (RO, read by the ufunc)
+```
+
+---
+
 ## Demo 1 — Integrity: Tamper-Sentinel KILL  *(any Linux host, needs `bpftrace`)*
 
 Proves the root sentinel SIGKILLs a tenant the instant it tries to regain write access to the

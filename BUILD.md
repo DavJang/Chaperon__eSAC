@@ -36,6 +36,8 @@ cd bpftime && make build        # produces the agent + syscall-server shared obj
 ```sh
 # comm-plane loader (injects C_Filter; RX+TX)
 gcc bpftime_Loader/src/c_loader.c            -o bpftime_Loader/c_loader        -lbpf -lelf -lz
+# comm-plane RX-only datapath loader (the throughput experiments' RX enforcer)
+gcc bpftime_Loader/src/c_loader_rx.c         -o bpftime_Loader/c_loader_rx     -lbpf -lelf -lz
 # resource-plane loaders
 gcc Resource_Bank/src/r_loader.c             -o Resource_Bank/r_loader         -lbpf -lelf -lz
 gcc Resource_Bank/src/r_loader_rate.c        -o Resource_Bank/r_loader_rate    -lbpf -lelf -lz
@@ -70,6 +72,18 @@ gcc -shared -fPIC -O2 bpftime_Agent/ufunc/src/esac_hs_ufunc.c \
 ```
 The runtime entry symbol is `esac_hs_scan`, resolved by bpftime at run time via
 `ufunc_find_func_id("esac_hs_scan")`.
+
+## 5b. Build the L7 Hyperscan-DB control tools
+
+These materialize the read-only match DBs the L7 ufunc reads (`/dev/shm/esac_hs_db`,
+`/dev/shm/esac_dom_db`). Required for any L7 (DNS/verb) enforcement; see RUN.md.
+
+```sh
+gcc bpftime_Agent/ufunc/hsdb_ctl/src/esac_hs_ctl_rx.c \
+    -o bpftime_Agent/ufunc/hsdb_ctl/esac_hs_ctl_rx    -lhs
+gcc bpftime_Agent/ufunc/hsdb_ctl/src/esac_dom_ctl_bulk.c \
+    -o bpftime_Agent/ufunc/hsdb_ctl/esac_dom_ctl_bulk
+```
 
 ## 6. Tamper Sentinel
 
