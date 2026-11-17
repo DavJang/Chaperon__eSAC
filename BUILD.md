@@ -39,8 +39,8 @@ gcc bpftime_Loader/src/c_loader.c            -o bpftime_Loader/c_loader        -
 # comm-plane RX-only datapath loader (the throughput experiments' RX enforcer)
 gcc bpftime_Loader/src/c_loader_rx.c         -o bpftime_Loader/c_loader_rx     -lbpf -lelf -lz
 # resource-plane loaders
-gcc Resource_Bank/src/r_loader.c             -o Resource_Bank/r_loader         -lbpf -lelf -lz
-gcc Resource_Bank/src/r_loader_rate.c        -o Resource_Bank/r_loader_rate    -lbpf -lelf -lz
+gcc bpftime_Loader/src/r_loader.c             -o bpftime_Loader/r_loader         -lbpf -lelf -lz
+gcc bpftime_Loader/src/r_loader_rate.c        -o bpftime_Loader/r_loader_rate    -lbpf -lelf -lz
 ```
 
 The loader sources `#include` small headers shipped next to them (`bpftime_Loader/src/ebpf/…`,

@@ -100,7 +100,7 @@ BPF programs to exported DPDK symbols as `BPF_MODIFY_RETURN` (so `bpf_override_r
 # config: one hook per line  <lib_path> <offset_hex> <prog_name>   (offset from: nm -D <lib>)
 printf '%s %s q_rte_malloc\n'  "$EAL" "$(nm -D "$EAL"|awk '/ rte_malloc@/{print $1;exit}')"  > cfg
 sudo env BPFTIME_GLOBAL_SHM_NAME=$SHM LD_PRELOAD=bpftime_Loader/libbpftime-syscall-server.so \
-  Resource_Bank/r_loader_rate bpftime_Agent/R_Filter/r_filter_quota.bpf.o <tenant-pid> cfg
+  bpftime_Loader/r_loader_rate bpftime_Agent/R_Filter/r_filter_quota.bpf.o <tenant-pid> cfg
 # throttle instead: use r_filter_rate.bpf.o with prog cp_rate_ptr / cp_rate_int.
 ```
 

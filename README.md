@@ -7,8 +7,8 @@ kernel transition on the packet hot path** — it enforces three planes, organiz
 
 ```
 eSAC/
-├── Resource_Bank/     host: admission + override + throttle (+ kill backstop)
-├── bpftime_Loader/    host: injects the Agent into the tenant and loads its BPF programs
+├── Resource_Bank/     host: resource admission gate (quota screen, pre-exec)
+├── bpftime_Loader/    host: ALL host loaders (c_loader + r_loader/r_loader_rate) + syscall-server; inject Agent + load BPF
 ├── Policy_Maps/       host: per-tenant RO policy (L4 + resource), generated + loaded into shm
 ├── Tamper_Sentinel/   host: root bpftrace, 2-vector (mprotect, openat /proc/self/mem) -> SIGKILL
 └── bpftime_Agent/     tenant (injected): Frida + R_Filter + C_Filter + ufunc
@@ -18,8 +18,9 @@ eSAC/
     └── ufunc/         L7 Hyperscan provider + its RO pattern/payload DBs
 ```
 
-Convention: a **host loader lives with its host component** (`Resource_Bank`, `bpftime_Loader`);
-the **BPF program it injects lives under the Agent submodule that runs it** (`R_Filter`, `C_Filter`).
+Convention: **host loaders live under `bpftime_Loader`** (comm `c_loader*` + resource `r_loader*`);
+the **BPF program each injects lives under the Agent submodule that runs it** (`R_Filter`, `C_Filter`);
+admission/policy stays with its plane (`Resource_Bank/esac_admit.sh`).
 
 ## The three planes
 
