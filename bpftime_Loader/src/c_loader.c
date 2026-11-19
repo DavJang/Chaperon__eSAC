@@ -956,6 +956,32 @@ static struct bpf_map *find_rodata_map(struct bpf_object *obj)
     return NULL;
 }
 
+/* === eSAC auto debug-symbol discovery (stripped-binary support) ===
+ * If a PMD .so is stripped, locate its separate debug file via GNU build-id
+ * (/usr/lib/debug/.build-id/XX/YYY.debug). Symbols come from the debug file;
+ * uprobe attach still targets the real loaded .so. Returns malloc'd path or NULL. */
+static char *auto_debug_lib(const char *lib)
+{
+    if (!lib) return NULL;
+    char cmd[1024], buf[600];
+    snprintf(cmd, sizeof(cmd),
+        "nm '%s' 2>/dev/null | grep -qE ' (t|T|W) mlx5_(rx|tx).*burst' && echo Y", lib);
+    FILE *f = popen(cmd, "r"); int have=0;
+    if (f){ if(fgets(buf,sizeof(buf),f)) have=1; pclose(f);} 
+    if (have) return NULL;
+    snprintf(cmd, sizeof(cmd),
+        "file -L '%s' 2>/dev/null | grep -oE 'BuildID.sha1.=[0-9a-f]+' | cut -d= -f2", lib);
+    f = popen(cmd, "r"); char bid[128]={0};
+    if (f){ if(fscanf(f,"%127s",bid)!=1) bid[0]=0; pclose(f);} 
+    if (bid[0]){
+        char *p=malloc(700);
+        snprintf(p,700,"/usr/lib/debug/.build-id/%.2s/%s.debug",bid,bid+2);
+        if (access(p,R_OK)==0) return p;
+        free(p);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     static struct option lopts[] = {
@@ -1011,6 +1037,11 @@ int main(int argc, char **argv)
         }
     }
     if (!G.bpf_obj || !G.offsets_path) { usage(argv[0]); return 1; }
+    if (!G.pmd_debug_lib_path && G.pmd_lib_path) {
+        char *d = auto_debug_lib(G.pmd_lib_path);
+        if (d) { G.pmd_debug_lib_path = d;
+            fprintf(stderr, "[comm] auto debug-symbols: %s -> %s\n", G.pmd_lib_path, d); }
+    }
     if (!G.attach_pid_count) {
         fprintf(stderr, "[comm] --attach-pid is required; refusing global uprobe attach\n");
         return 1;

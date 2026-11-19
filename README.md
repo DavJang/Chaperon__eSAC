@@ -71,3 +71,14 @@ Shipped prebuilt (small, but linked for the validation rig's DPDK — rebuild fo
 (`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled
 Tamper-Sentinel C++ binaries (the canonical sentinel is the bpftrace script
 `Tamper_Sentinel/tamper_sentinel_event.sh`, which needs no build).
+
+## Attaching to stripped stock DPDK apps (auto debug-symbol discovery)
+
+`c_loader`'s driver-level RX/TX hooks resolve the PMD burst symbols (e.g. `mlx5_rx_burst*`)
+by file offset. When the target app links a **stripped** DPDK (as distro packages do), those
+symbols are absent from the loaded `.so`. If a matching separate debug file is installed
+(`/usr/lib/debug/.build-id/XX/YYY.debug`, e.g. from a distro `-dbg`/`dbgsym` package),
+`c_loader` now **auto-discovers it via the .so's GNU build-id**, resolves the offsets from the
+debug file, and attaches the uprobe to the real loaded `.so`. No manual `--pmd-debug-lib` is
+needed (pass it only to override); when the symbols are already visible (non-stripped build),
+discovery is skipped.
