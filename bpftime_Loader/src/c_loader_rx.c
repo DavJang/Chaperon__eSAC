@@ -1,10 +1,10 @@
 /*
- * comm_loader.c
+ * c_loader.c
  * --------------------------------------------------------------
  * Phase 2 통신 접근 제어 로더.
  *
  * 책임:
- *   1) comm_filter.bpf.o 를 연다.
+ *   1) c_filter.bpf.o 를 연다.
  *   2) tools/discover_offsets 가 출력한 mbuf 오프셋을
  *      libbpf .rodata (runtime_config) 에 주입한다.
  *   3) BPF load.
@@ -20,12 +20,12 @@
  *   7) comm_events ringbuf 폴링.
  *   8) SIGUSR1 수신 시 queue_stats / lat_hist 합산해서 stderr 에 출력.
  *
- * 빌드: gcc comm_loader.c -o comm_loader -lbpf -lelf -lz
+ * 빌드: gcc c_loader.c -o c_loader -lbpf -lelf -lz
  *
  * 실행 예:
  *   # API level RX + Driver level TX (권장)
- *   sudo ./comm_loader \
- *     --bpf ./ebpf/comm_filter.bpf.o \
+ *   sudo ./c_loader \
+ *     --bpf ./ebpf/c_filter.bpf.o \
  *     --lib /usr/local/lib/x86_64-linux-gnu/librte_ethdev.so \
  *     --pmd-lib /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so \
  *     --offsets ./tools/offsets.json \
@@ -92,7 +92,7 @@ static volatile int g_prologue_tamper_sentinel_run = 1;
 /* ── Prologue Integrity TamperSentinel (RDNet-style process_vm_readv) ──────────
  * bpftime mode에서 악의적 테넌트가 PMD 함수 프롤로그를 복원해 후크를
  * 제거하는 공격을 탐지한다.
- * comm_loader 가 --pid <pid> 를 받으면:
+ * c_loader 가 --pid <pid> 를 받으면:
  *   (1) 대상 프로세스 메모리에서 각 PMD 심볼의 런타임 주소를 계산
  *   (2) uprobe/bpftime 패치 직후의 기대 바이트를 스냅샷
  *   (3) PROLOGUE_POLL_US 마다 process_vm_readv 로 재확인
@@ -414,7 +414,7 @@ static int attach_uprobe_scoped(struct bpf_program *prog, bool ret,
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s --bpf <comm_filter.bpf.o> --lib <librte_ethdev.so>\n"
+        "usage: %s --bpf <c_filter.bpf.o> --lib <librte_ethdev.so>\n"
         "          --offsets <path>     mbuf 오프셋 파일 (필수)\n"
         "          [--pmd-lib <path>]   PMD 드라이버 라이브러리 (드라이버 레벨 후킹)\n"
         "                               예: /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so\n"
@@ -782,7 +782,7 @@ static int handle_event(void *ctx, void *data, size_t sz)
 
     /*
      * bpftime에는 커널 전용 헬퍼인 bpf_send_signal()이 없어서 BPF
-     * 프로그램 안에서 직접 시그널을 보낼 수 없다 (comm_filter_bpftime.bpf.c
+     * 프로그램 안에서 직접 시그널을 보낼 수 없다 (c_filter_bpftime.bpf.c
      * 참고). 대신 여기 유저스페이스 loader가 comm_events로 ACT_KILL
      * 이벤트를 받으면 대상 PID만 정확히 SIGKILL한다 (tamper_sentinel의
      * kill(g_pw[i].pid, SIGKILL) 패턴과 동일 — cgroup 전체가 아니라
@@ -1168,7 +1168,7 @@ int main(int argc, char **argv)
             if (!p_drv_entry || !p_drv_ret) {
                 fprintf(stderr,
                     "[comm] ERROR: driver-level RX BPF programs missing."
-                    " Rebuild comm_filter.bpf.o\n");
+                    " Rebuild c_filter.bpf.o\n");
             } else {
                 for (int i = 0; RX_DRIVER_SYMS[i]; i++) {
                     const char *sym_lib = G.pmd_debug_lib_path ? G.pmd_debug_lib_path : G.pmd_lib_path;
@@ -1221,7 +1221,7 @@ int main(int argc, char **argv)
         if (!p_tx) {
             fprintf(stderr,
                 "[comm] ERROR: uprobe_tx_burst BPF program missing."
-                " Rebuild comm_filter.bpf.o\n");
+                " Rebuild c_filter.bpf.o\n");
         } else {
             for (int i = 0; TX_DRIVER_SYMS[i]; i++) {
                 const char *sym_lib = G.pmd_debug_lib_path ? G.pmd_debug_lib_path : G.pmd_lib_path;
@@ -1295,7 +1295,7 @@ int main(int argc, char **argv)
     struct ring_buffer *rb = ring_buffer__new(ev_fd, handle_event, NULL, NULL);
     if (!rb) { fprintf(stderr, "perf_buffer failed\n"); return 1; }
 
-    fprintf(stderr, "[comm_loader] ready. SIGUSR1=stats dump, SIGINT=exit.\n");
+    fprintf(stderr, "[c_loader] ready. SIGUSR1=stats dump, SIGINT=exit.\n");
 
     unsigned cgroup_check_counter = 0;
     while (!exiting) {

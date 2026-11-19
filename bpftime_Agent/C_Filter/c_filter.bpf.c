@@ -1,5 +1,5 @@
 /*
- * comm_filter.bpf.c - L4 communication access control (no-BTF edition).
+ * c_filter.bpf.c - L4 communication access control (no-BTF edition).
  * Hooks rx/tx burst at the driver level; the loader injects mbuf offsets
  * and config into .rodata (RCFG). cgroup mode: tenant ID is selected
  * outside the packet path.
@@ -588,10 +588,10 @@ static __noinline int pkt_cb(__u32 idx, void *arg)
     if (action == ACT_KILL) {
         if (RCFG.features & FEAT_ENFORCEMENT) {
             /* bpftime has no in-VM signal helper (bpf_send_signal is a
-             * kernel-only helper); comm_loader performs the actual
+             * kernel-only helper); c_loader performs the actual
              * kill(pid, SIGKILL) in userspace when it receives this
              * event via comm_events (see handle_event() in
-             * comm_loader.c). */
+             * c_loader.c). */
             if (c->out_worst < ACT_KILL) c->out_worst = ACT_KILL;
         }
     } else if (action == ACT_DROP) {

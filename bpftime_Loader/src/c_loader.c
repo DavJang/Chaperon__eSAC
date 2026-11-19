@@ -1,10 +1,10 @@
 /*
- * comm_loader.c - userspace loader for the comm-access-control BPF filter.
+ * c_loader.c - userspace loader for the comm-access-control BPF filter.
  * Injects mbuf offsets into .rodata, loads the BPF object, hooks RX/TX
  * (API-level rte_eth_rx_burst or driver-level PMD symbols), loads the JSON
  * policy, and polls the comm_events ringbuf.
  *
- * Build: gcc comm_loader.c -o comm_loader -lbpf -lelf -lz
+ * Build: gcc c_loader.c -o c_loader -lbpf -lelf -lz
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -343,7 +343,7 @@ struct options {
     int latency_sample;
     int max_burst_inspect;
     int no_pin;   /* --no-pin: disable map pinning (bpftime mode) */
-    int pid;      /* --pid: prologue-integrity watchdog target PID (-1 = disabled) */
+    int pid;      /* --pid: prologue-integrity Tamper Sentinel target PID (-1 = disabled) */
     int attach_pids[8]; /* --attach-pid: attach uprobe only to the given processes */
     int attach_pid_count;
 };
@@ -429,7 +429,7 @@ static int attach_uprobe_scoped(struct bpf_program *prog, bool ret,
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s --bpf <comm_filter.bpf.o> --lib <librte_ethdev.so>\n"
+        "usage: %s --bpf <c_filter.bpf.o> --lib <librte_ethdev.so>\n"
         "          --offsets <path>     mbuf offset file (required)\n"
         "          [--pmd-lib <path>]   PMD driver library (driver-level hooking)\n"
         "                               e.g. /usr/local/lib/x86_64-linux-gnu/librte_net_mlx5.so\n"
@@ -439,7 +439,7 @@ static void usage(const char *prog)
         "          [--vlan-count] [--latency-sample]\n"
         "          [--max-burst-inspect N]\n"
         "          [--no-pin]   bpftime mode: disable map pinning (avoid EINVAL)\n"
-          "          [--pid <pid>]  prologue-integrity watchdog target PID\n"
+          "          [--pid <pid>]  prologue-integrity Tamper Sentinel target PID\n"
           "                         (detects hook-removal attacks in bpftime mode)\n"
           "          [--attach-pid <pid>]  uprobe target PID (may be repeated)\n",
         prog);
@@ -1215,7 +1215,7 @@ int main(int argc, char **argv)
             if (!p_drv_entry || !p_drv_ret) {
                 fprintf(stderr,
                     "[comm] ERROR: driver-level RX BPF programs missing."
-                    " Rebuild comm_filter.bpf.o\n");
+                    " Rebuild c_filter.bpf.o\n");
             } else {
                 for (int i = 0; RX_DRIVER_SYMS[i]; i++) {
                     const char *sym_lib = G.pmd_debug_lib_path ? G.pmd_debug_lib_path : G.pmd_lib_path;
@@ -1233,7 +1233,7 @@ int main(int argc, char **argv)
                         fprintf(stderr,
                             "[comm] RX attached at DRIVER level: %s @ %s (offset=0x%lx)\n",
                             RX_DRIVER_SYMS[i], G.pmd_lib_path, off);
-                        /* register prologue-integrity watchdog */
+                        /* register prologue-integrity Tamper Sentinel */
                         pw_register(G.pmd_lib_path, off, RX_DRIVER_SYMS[i]);
 
                     } else if (G.verbose)
@@ -1268,7 +1268,7 @@ int main(int argc, char **argv)
         if (!p_tx) {
             fprintf(stderr,
                 "[comm] ERROR: uprobe_tx_burst BPF program missing."
-                " Rebuild comm_filter.bpf.o\n");
+                " Rebuild c_filter.bpf.o\n");
         } else {
             for (int i = 0; TX_DRIVER_SYMS[i]; i++) {
                 const char *sym_lib = G.pmd_debug_lib_path ? G.pmd_debug_lib_path : G.pmd_lib_path;
@@ -1285,7 +1285,7 @@ int main(int argc, char **argv)
                     fprintf(stderr,
                         "[comm] TX attached at DRIVER level: %s @ %s (offset=0x%lx)\n",
                         TX_DRIVER_SYMS[i], G.pmd_lib_path, off);
-                    /* register prologue-integrity watchdog */
+                    /* register prologue-integrity Tamper Sentinel */
                     pw_register(G.pmd_lib_path, off, TX_DRIVER_SYMS[i]);
                     /* add TX uretprobe for latency sampling */
                     struct bpf_program *p_tx_ret = getenv("ESAC_TX_NO_URET") ? NULL :
@@ -1342,7 +1342,7 @@ int main(int argc, char **argv)
     struct ring_buffer *rb = ring_buffer__new(ev_fd, handle_event, NULL, NULL);
     if (!rb) { fprintf(stderr, "perf_buffer failed\n"); return 1; }
 
-    fprintf(stderr, "[comm_loader] ready. SIGUSR1=stats dump, SIGINT=exit.\n");
+    fprintf(stderr, "[c_loader] ready. SIGUSR1=stats dump, SIGINT=exit.\n");
 
     unsigned cgroup_check_counter = 0;
     while (!exiting) {
