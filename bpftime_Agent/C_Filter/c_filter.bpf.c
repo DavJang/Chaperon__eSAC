@@ -209,7 +209,7 @@ struct policy_lookup_args {
 };
 
 /* Return UINT32_MAX when this specificity class has no match. */
-/* opt3: probe only slots whose bit is set in the mask (base = class*5).
+/* probe_mask: probe only slots whose bit is set in the mask (base = class*5).
  * Key mutations run unconditionally so later probes see the right key state;
  * only the map lookup is gated. */
 static __noinline __u32 lookup_one_class(const struct policy_lookup_args *a,
@@ -267,7 +267,7 @@ lookup_action_slow(__u64 tenant_id, __u8 proto, __u16 dst_port,
     a.dst_port = dst_port;
     a.proto = proto;
 
-    /* opt3: probe mask packed in RCFG.features bits 8..27 (20 bits). */
+    /* probe_mask: probe mask packed in RCFG.features bits 8..27 (20 bits). */
     __u32 mask = (RCFG.features >> 8) & 0xFFFFFu;
     /* base: (tenant=0 / global=10) + (src_port exact=0 / wildcard=5) */
     if (mask & (0x1Fu << 0)) {               /* tenant, src_port exact */
