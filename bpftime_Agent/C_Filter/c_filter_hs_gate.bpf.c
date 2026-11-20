@@ -504,7 +504,7 @@ static __noinline int pkt_prescan(__u32 idx, void *arg)
             /* content candidate gate: only DNS(qd==1)/TLS-ClientHello/HTTP shapes go to the ufunc */
             unsigned char pl12[12];
             int cand = 0;
-            if (pl_len >= 12 && read_user(pl12, (void *)(unsigned long)pl_ptr, 12) == 0) {
+            if (pl_len >= 4 && read_user(pl12, (void *)(unsigned long)pl_ptr, 12) == 0) {
                 __u16 qd = ((__u16)pl12[4] << 8) | pl12[5];
                 if (proto == 17 && qd == 1) cand = 1;                  /* DNS-ish */
                 else if (pl12[0] == 0x16 && pl12[5] == 0x01) cand = 1;  /* TLS ClientHello */
