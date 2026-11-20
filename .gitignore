@@ -1,7 +1,7 @@
 # Large third-party bpftime runtime (each ~100 MB, over GitHub's file limit) -- build per BUILD.md
 bpftime_Agent/Frida/libbpftime-agent.so
 bpftime_Agent/Frida/libbpftime-agent-transformer.so
-bpftime_Agent/ufunc/libbpftime-agent-hs.so
+bpftime_Agent/H_matcher/libbpftime-agent-hs.so
 bpftime_Loader/libbpftime-syscall-server.so
 
 # Large compiled Tamper-Sentinel C++ binaries -- canonical sentinel is the bpftrace script

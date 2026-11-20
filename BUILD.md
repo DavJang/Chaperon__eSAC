@@ -11,7 +11,7 @@ against your own DPDK/libbpf.
 | **DPDK** (22.11+) with your NIC's PMD | the tenant app + loaders' `--lib` | distro `dpdk-dev`, or Mellanox OFED, or build from dpdk.org |
 | **libbpf** + headers, libelf, zlib | the loaders (`-lbpf -lelf -lz`) | `apt install libbpf-dev libelf-dev zlib1g-dev` |
 | **clang/LLVM 14** | compiling the eBPF objects | `apt install clang-14 llvm-14` |
-| **Hyperscan** (`-lhs`) | the L7 ufunc provider | `apt install libhyperscan-dev` |
+| **Hyperscan** (`-lhs`) | the L7 Hyperscan matcher (H_matcher) | `apt install libhyperscan-dev` |
 | **bpftime** | the injected Agent runtime (the big `.so`, not in this repo) | build from source, below |
 | **bpftrace** | the Tamper Sentinel | `apt install bpftrace` |
 
@@ -27,7 +27,7 @@ cd bpftime && make build        # produces the agent + syscall-server shared obj
 # copy/symlink the results into:
 #   bpftime_Agent/Frida/libbpftime-agent.so
 #   bpftime_Agent/Frida/libbpftime-agent-transformer.so
-#   bpftime_Agent/ufunc/libbpftime-agent-hs.so   (Hyperscan-enabled agent build)
+#   bpftime_Agent/H_matcher/libbpftime-agent-hs.so   (Hyperscan-enabled agent build)
 #   bpftime_Loader/libbpftime-syscall-server.so
 ```
 
@@ -64,25 +64,25 @@ $BPF -c bpftime_Agent/R_Filter/r_filter_rate.bpf.c     -o bpftime_Agent/R_Filter
 The loaders resolve BPF **program/section names** (e.g. `rl_flow_create`, `q_rte_malloc`,
 `cp_rate_ptr`, `mem_quota_ptr`) by name — do not rename those inside the sources.
 
-## 5. Build the L7 ufunc provider
+## 5. Build the L7 Hyperscan matcher (H_matcher)
 
 ```sh
-gcc -shared -fPIC -O2 bpftime_Agent/ufunc/src/esac_hs_ufunc.c \
-    -o bpftime_Agent/ufunc/esac_hs_ufunc.so -lhs
+gcc -shared -fPIC -O2 bpftime_Agent/H_matcher/src/esac_hs_ufunc.c \
+    -o bpftime_Agent/H_matcher/esac_hs_ufunc.so -lhs
 ```
 The runtime entry symbol is `esac_hs_scan`, resolved by bpftime at run time via
 `ufunc_find_func_id("esac_hs_scan")`.
 
 ## 5b. Build the L7 Hyperscan-DB control tools
 
-These materialize the read-only match DBs the L7 ufunc reads (`/dev/shm/esac_hs_db`,
+These materialize the read-only match DBs the H_matcher reads (`/dev/shm/esac_hs_db`,
 `/dev/shm/esac_dom_db`). Required for any L7 (DNS/verb) enforcement; see RUN.md.
 
 ```sh
-gcc bpftime_Agent/ufunc/hsdb_ctl/src/esac_hs_ctl_rx.c \
-    -o bpftime_Agent/ufunc/hsdb_ctl/esac_hs_ctl_rx    -lhs
-gcc bpftime_Agent/ufunc/hsdb_ctl/src/esac_dom_ctl_bulk.c \
-    -o bpftime_Agent/ufunc/hsdb_ctl/esac_dom_ctl_bulk
+gcc bpftime_Agent/H_matcher/hsdb_ctl/src/esac_hs_ctl_rx.c \
+    -o bpftime_Agent/H_matcher/hsdb_ctl/esac_hs_ctl_rx    -lhs
+gcc bpftime_Agent/H_matcher/hsdb_ctl/src/esac_dom_ctl_bulk.c \
+    -o bpftime_Agent/H_matcher/hsdb_ctl/esac_dom_ctl_bulk
 ```
 
 ## 6. Tamper Sentinel

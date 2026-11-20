@@ -11,11 +11,11 @@ eSAC/
 ├── bpftime_Loader/    host: ALL host loaders (c_loader + r_loader/r_loader_rate) + syscall-server; inject Agent + load BPF
 ├── Policy_Maps/       host: per-tenant RO policy (L4 + resource), generated + loaded into shm
 ├── Tamper_Sentinel/   host: root bpftrace, 2-vector (mprotect, openat /proc/self/mem) -> SIGKILL
-└── bpftime_Agent/     tenant (injected): Frida + R_Filter + C_Filter + ufunc
+└── bpftime_Agent/     tenant (injected): Frida + R_Filter + C_Filter + H_matcher
     ├── Frida/         installs PMD RX/TX burst hooks + rte_* uprobes
     ├── R_Filter/      resource-plane BPF: override (NULL/-EAGAIN) + rate throttle
     ├── C_Filter/      comm-plane L4 mask-probe hash + L7 gate (LLVM-JIT)
-    └── ufunc/         L7 Hyperscan provider + its RO pattern/payload DBs
+    └── H_matcher/     L7 Hyperscan matcher (uses bpftime ufunc provider) + its RO pattern/payload DBs
 ```
 
 Convention: **host loaders live under `bpftime_Loader`** (comm `c_loader*` + resource `r_loader*`);
@@ -67,7 +67,7 @@ eSAC's concern — it guards only the **PF-shared NIC** and **host** resources S
 
 Shipped prebuilt (small, but linked for the validation rig's DPDK — rebuild for your own):
 `c_loader`, `c_loader_rx` (RX-only datapath loader), `c_loader_tx`, `r_loader`, `r_loader_rate`, the `*.bpf.o` eBPF objects,
-`ufunc/esac_hs_ufunc.so`, and the L7 Hyperscan-DB builders `ufunc/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. **Not shipped** (build per BUILD.md): the bpftime runtime
+`H_matcher/esac_hs_ufunc.so`, and the L7 Hyperscan-DB builders `H_matcher/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. **Not shipped** (build per BUILD.md): the bpftime runtime
 (`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled
 Tamper-Sentinel C++ binaries (the canonical sentinel is the bpftrace script
 `Tamper_Sentinel/tamper_sentinel_event.sh`, which needs no build).

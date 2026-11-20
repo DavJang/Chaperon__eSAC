@@ -10,16 +10,16 @@ Run everything from the repo root. Root is required (bpftrace, uprobe attach, hu
 
 ## L7 prerequisite — build the Hyperscan match DB  *(before any L7 enforcement)*
 
-The L7 ufunc reads two read-only match DBs from shared memory. Materialize them once
+The H_matcher reads two read-only match DBs from shared memory. Materialize them once
 (after building the `hsdb_ctl` tools, BUILD.md §5b):
 
 ```sh
 # domain-list DB (empty baseline shown; swap /dev/null for your allow/deny list)
-./bpftime_Agent/ufunc/hsdb_ctl/esac_dom_ctl_bulk /esac_dom_db /dev/null none
+./bpftime_Agent/H_matcher/hsdb_ctl/esac_dom_ctl_bulk /esac_dom_db /dev/null none
 # Hyperscan pattern DB from the shipped Suricata DNS ruleset
-./bpftime_Agent/ufunc/hsdb_ctl/esac_hs_ctl_rx   /esac_hs_db \
-    bpftime_Agent/ufunc/patterns/suricata_dns_patterns.txt none
-# -> creates /dev/shm/esac_hs_db and /dev/shm/esac_dom_db (RO, read by the ufunc)
+./bpftime_Agent/H_matcher/hsdb_ctl/esac_hs_ctl_rx   /esac_hs_db \
+    bpftime_Agent/H_matcher/patterns/suricata_dns_patterns.txt none
+# -> creates /dev/shm/esac_hs_db and /dev/shm/esac_dom_db (RO, read by the H_matcher (bpftime ufunc))
 ```
 
 ---
@@ -82,10 +82,10 @@ enforcement signal is the loader's `ACT_DROP … dropped=N`.)
 
 ## Demo 4 — Communication: L7 DROP  *(DPDK NIC)*
 
-Proves the Hyperscan ufunc drops by **payload content** at the same 5-tuple that L4 allows
+Proves the H_matcher (Hyperscan) drops by **payload content** at the same 5-tuple that L4 allows
 (e.g. redis `SET` dropped, `GET` allowed). Same attach pattern as Demo 3 but with
-`--bpf bpftime_Agent/C_Filter/c_filter_hs_gate.bpf.o` and the ufunc provider
-`bpftime_Agent/ufunc/esac_hs_ufunc.so` preloaded; the policy carries a Hyperscan pattern
+`--bpf bpftime_Agent/C_Filter/c_filter_hs_gate.bpf.o` and the H_matcher provider lib
+`bpftime_Agent/H_matcher/esac_hs_ufunc.so` preloaded; the policy carries a Hyperscan pattern
 (e.g. `SET:drop`). The L7 match runs in the agent via `ufunc_find_func_id("esac_hs_scan")`.
 
 ---
