@@ -110,7 +110,7 @@ ceiling, a quota-tightened build forced the tenant's EAL-init `rte_malloc` to `N
 tenant failed closed —
 
 ```
-[gov] q_rte_malloc  -> librte_eal.so.23@0x27b30  (attached, BPF_MODIFY_RETURN)
+[r_loader] q_rte_malloc  -> librte_eal.so.23@0x27b30  (attached, BPF_MODIFY_RETURN)
 tenant: EAL: error allocating rte services array / rte_service_init() failed
 ```
 

@@ -51,17 +51,17 @@ int main(int argc, char **argv)
         if (sscanf(line, "%511s %lx %127s", lib, &off, prog) != 3) continue;
         n++;
         struct bpf_program *p = bpf_object__find_program_by_name(o, prog);
-        if (!p) { fprintf(stderr, "[gov] prog %s not found\n", prog); continue; }
+        if (!p) { fprintf(stderr, "[r_loader] prog %s not found\n", prog); continue; }
         /* perf_event_open override needs a persistent copy of the lib path string */
         char *libdup = strdup(lib);
         int pfd = peo_override(libdup, off, pid);
-        if (pfd < 0) { fprintf(stderr, "[gov] peo fail %s@%s: %d\n", prog, lib, pfd); continue; }
+        if (pfd < 0) { fprintf(stderr, "[r_loader] peo fail %s@%s: %d\n", prog, lib, pfd); continue; }
         int r = bpf_prog_attach(bpf_program__fd(p), pfd, BPF_MODIFY_RETURN, 0);
-        fprintf(stderr, "[gov] %-14s -> %s@0x%lx rc=%d\n", prog, lib, off, r);
+        fprintf(stderr, "[r_loader] %-14s -> %s@0x%lx rc=%d\n", prog, lib, off, r);
         if (r == 0) ok++;
     }
     fclose(f);
-    fprintf(stderr, "[gov] ready: %d/%d hooks attached (pid=%d). holding shm...\n", ok, n, pid);
+    fprintf(stderr, "[r_loader] ready: %d/%d hooks attached (pid=%d). holding shm...\n", ok, n, pid);
     fflush(stderr);
     while (!exiting) sleep(1);
     bpf_object__close(o);

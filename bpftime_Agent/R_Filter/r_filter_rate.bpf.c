@@ -1,4 +1,4 @@
-// eSAC control-plane + resource GOVERNOR. Throttles a tenant's shared NIC
+// eSAC control-plane + resource R_Filter rate-limiter. Throttles a tenant's shared NIC
 // control-plane API churn (rate) and caps shared host-memory allocation (quota)
 // via in-process uprobe override. 3 programs (attached to many symbols by the
 // loader): cp_rate_ptr (rate, deny->NULL), cp_rate_int (rate, deny->-EAGAIN),
@@ -30,16 +30,16 @@ static __always_inline int over_rate(void)
     if (!s) {
         struct rl i = {}; i.last_ns = now; i.tok_milli = (__s64)cap - 1000; i.allowed = 1;
         bpf_map_update_elem(&cp_state, &pid, &i, BPF_ANY);
-        bpf_printk("CPGOV ALLOW pid=%u first", pid);
+        bpf_printk("R_FILTER ALLOW pid=%u first", pid);
         return 0;
     }
     __u64 dt = now - s->last_ns; s->last_ns = now;
     s->tok_milli += (__s64)((dt * RATE_PER_SEC) / 1000000ULL);
     if (s->tok_milli > (__s64)cap) s->tok_milli = (__s64)cap;
     if (s->tok_milli >= 1000) { s->tok_milli -= 1000; s->allowed++;
-        bpf_printk("CPGOV ALLOW pid=%u allowed=%llu", pid, s->allowed); return 0; }
+        bpf_printk("R_FILTER ALLOW pid=%u allowed=%llu", pid, s->allowed); return 0; }
     s->denied++;
-    bpf_printk("CPGOV DENY(rate) pid=%u denied=%llu", pid, s->denied);
+    bpf_printk("R_FILTER DENY(rate) pid=%u denied=%llu", pid, s->denied);
     return 1;
 }
 
