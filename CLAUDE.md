@@ -23,8 +23,14 @@ bpftime** (a dependency, **not** a fork). Follow these rules on every change in 
 
 ## Experiments
 7. **Results go to `~/eSAC-runs/`, never `~/` or the repo.** Launch experiments through
-   `benchmarks/esac_run.sh` (it sets the output dir and writes `meta.json`: git commit, ruleset
-   sha256, config, timing, metrics). **Wrap existing harnesses — do not rewrite their logic.**
+   `benchmarks/esac_run.sh` (it sets a collision-safe output dir, writes `meta.json` — git commit,
+   ruleset sha256, config, timing — a before/after system snapshot, and a report-only post-run
+   residual check). **Wrap existing harnesses — do not rewrite their logic.**
+   - **Every new or modified harness MUST route its output through `$ESAC_RUNS`**, i.e.
+     `ROOT="${ESAC_RUNS:-<fallback>}"`, or be launched via `esac_run.sh`. A script that writes
+     results under `$HOME` (e.g. `ROOT=/home/.../esac_pps_*`) is a defect — fix it before use.
+   - `esac_run.sh`'s post-run check is **report-only**: it never kills a process or changes
+     NIC/VF/hugepage. Act on its warnings manually.
 8. **Benchmark provenance.** Keep **raw-scan** and **DNS-aware v2** results distinct. The headline
    throughput (89–96 % intra; ~7.5× a DPDK-IPS baseline @ 4 matched cores) is **raw-scan**; v2 is
    correctness-verified and re-measured only on the inter-host payload sweep so far. Mark pending
