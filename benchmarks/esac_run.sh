@@ -18,7 +18,13 @@ DESC="${2:?usage: esac_run.sh <type> <desc> -- <cmd...>}"
 shift 2
 [ "${1:-}" = "--" ] && shift
 
-RUNS="${ESAC_RUNS_ROOT:-$HOME/eSAC-runs}"
+# resolve the invoking user's home even under sudo ($HOME would be /root), so results
+# always land in the real user's ~/eSAC-runs, never /root/eSAC-runs
+RUNS="${ESAC_RUNS_ROOT:-}"
+if [ -z "$RUNS" ]; then
+  _uh=$(getent passwd "${SUDO_USER:-$(id -un)}" 2>/dev/null | cut -d: -f6)
+  RUNS="${_uh:-$HOME}/eSAC-runs"
+fi
 TS=$(date +%Y%m%d_%H%M%S)
 SAFE_DESC=$(echo "$DESC" | tr ' /' '__')
 # collision-safe unique dir: append _N if the timestamped name already exists
