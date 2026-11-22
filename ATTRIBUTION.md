@@ -12,7 +12,7 @@ authored by eSAC), the version observed on the build/validation host, and its li
 
 | Component | Role in eSAC | Version (observed) | License | Source |
 |---|---|---|---|---|
-| **bpftime** (`eunomia-bpf/bpftime`) | injected userspace eBPF runtime: Agent + syscall-server `.so`, LLVM-JIT, shared-memory maps | ⚠️ verify — no git checkout found on the build host | ⚠️ verify at upstream | https://github.com/eunomia-bpf/bpftime |
+| **bpftime** (`eunomia-bpf/bpftime`) | injected userspace eBPF runtime: Agent + syscall-server `.so`, LLVM-JIT, shared-memory maps | commit **edcc8ec** (2026-09-18); source checkout at `~/old/bpftime` on the build host | ⚠️ verify at upstream (reported MIT) | https://github.com/eunomia-bpf/bpftime |
 | **Frida / Frida-Gum** | bpftime's uprobe / inline-hook backend (installs the PMD RX/TX burst hooks) | 16.1.2 (prior audit — verify) | ⚠️ verify at upstream | https://github.com/frida/frida |
 | **Hyperscan** | L7 multi-pattern matching engine used by `H_matcher` | 5.4.0 (`libhyperscan-dev`, Debian) | ⚠️ verify at upstream | https://github.com/intel/hyperscan |
 | **DPDK** | target dataplane (eSAC runs inside unmodified DPDK apps) | 24.11 (rig) | ⚠️ verify at upstream | https://www.dpdk.org |
