@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <signal.h>
 
 /* ---- dlsym-visible rte_pktmbuf_free_bulk shim (for the L7 per-packet DROP path) ----
  * The tenant's rte_pktmbuf_free_bulk is statically linked and NOT resolvable via
@@ -49,10 +50,16 @@ void rte_pktmbuf_free_bulk(void **mbufs, unsigned int count)
                 real_fb = (void (*)(void **, unsigned int))s;
         }
     }
-    if (real_fb) real_fb(mbufs, count);
-    /* if still unresolved: no-op. The dropped mbufs were already excluded from the burst by
-     * the gate's compaction (never returned to the app), so there is no use-after-free; the
-     * only risk is a transient leak, which the gate's cap-based fail-close already bounds. */
+    if (real_fb) { real_fb(mbufs, count); return; }
+    /* Real symbol unresolved at drop time: the gate has already excluded these mbufs from the
+     * returned burst, so NOT freeing them would silently leak them out of the mempool. Do NOT
+     * return as if it succeeded. Fail-closed: terminate the tenant (SIGKILL) so the leak cannot
+     * accumulate and the enforcement failure is unmistakable — same safety posture as the
+     * gate's own ufunc-absent fail-close, just now detectable here. */
+    { static volatile int warned = 0; if (!warned) { warned = 1;
+        fprintf(stderr, "[esac_hs] FATAL: rte_pktmbuf_free_bulk unresolved at drop time; "
+                        "fail-close (SIGKILL self) to avoid mbuf leak\n"); } }
+    kill(getpid(), SIGKILL);
 }
 
 #define PAGE 4096UL
