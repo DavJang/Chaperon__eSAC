@@ -45,8 +45,16 @@ bpftime** (a dependency, **not** a fork). Follow these rules on every change in 
     claim unimplemented capability (e.g. DNS **compression is not decompressed** — fallback-only;
     stated in `bpftime_Agent/H_matcher/README.md`).
 
-## Canonical layout (target)
-- `~/eSAC/` — the **single** canonical dev repo (this tree). Do not spawn new `FINAL` / `eSACfinal`
-  / `GOWN` working copies.
+## Canonical layout
+- `~/eSAC/` — the **single** canonical dev repo (this tree), GitHub remote `DavJang/eSAC`. Do not
+  spawn new `FINAL` / `eSACfinal` / `GOWN` working copies; use branches + commits here instead.
 - `~/eSAC-runs/` — experiment outputs (`<type>/<timestamp>_<desc>/` + `meta.json`).
 - `~/eSAC-archive/` — old working trees & backups, read-only.
+- `~/bpftime/` — upstream bpftime dependency source.
+
+## Single source of truth (prevents the FINAL/eSACfinal divergence this cleanup fixed)
+- **All source edits happen in `~/eSAC` only.** `FINAL/eSAC` and any experiment rig are a
+  **deploy target**, not a source: built artifacts arrive via `tools/deploy.sh --install <rig>`
+  (which preserves the big bpftime runtime and backs up what it replaces). Never edit source or
+  rebuild independently inside a rig. If two trees ever diverge again, reconcile into `~/eSAC` and
+  re-deploy — do not keep editing both.
