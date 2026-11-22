@@ -1,224 +1,262 @@
-# eSAC
+# eSAC — eBPF-enforced Security Access Control for Multi-Tenant DPDK
 
-**eSAC** (eBPF-enforced Security Access Control for multi-tenant DPDK) is an **in-process**
-security layer for DPDK tenants. From inside an *unmodified* DPDK application — and with **no
-kernel transition on the packet hot path** — it enforces three planes, organized here as
-**five components**.
+**eSAC** is an **in-process** security layer for multi-tenant **DPDK** deployments. From *inside an
+unmodified DPDK tenant process* — and with **no kernel transition on the packet hot path** — it
+enforces per-tenant network access control, resource limits, and the integrity of that enforcement
+itself. eSAC is built **on**, not as a fork of, the userspace eBPF runtime
+[**bpftime**](https://github.com/eunomia-bpf/bpftime).
+
+---
+
+## A. Project Overview
+
+Kernel-bypass dataplanes (DPDK/SR-IOV) are the standard for NFV and high-performance cloud
+networking: a single physical NIC (PF) is partitioned into virtual functions (VFs), one per
+tenant, and each tenant polls its VF directly in userspace. **SR-IOV isolates each VF's own queues
+and port — but it does not isolate three things that still matter for a shared host:**
+
+1. **Who a tenant talks to on the wire.** There is no per-tenant L4/L7 access control on the
+   bypass path. Kernel firewalls (netfilter, tc-eBPF) never see the traffic, and an external
+   middlebox (e.g. a Suricata IDS) adds a forwarding hop and cannot inline into a tenant's
+   poll-mode loop.
+2. **Shared host/NIC resources.** The hugepage pool, the host allocator, and the NIC's shared
+   eSwitch flow-table / firmware steering are *not* partitioned by SR-IOV. One tenant can starve
+   its neighbours by **holding** a shared resource or by **churning** a shared control API.
+3. **The enforcement's own integrity.** A tenant owns its address space; any in-process guard it
+   can reach, it can try to peel off.
+
+**Approach.** eSAC injects the **bpftime** userspace-eBPF runtime into the unmodified tenant.
+Frida installs hooks on the PMD's RX/TX **burst** functions and on the relevant `rte_*` resource
+APIs; eSAC's eBPF policy programs run on bpftime's **LLVM-JIT in userspace, next to the DPDK poll
+loop**, so the packet hot path never traps into the kernel. On top of this runtime eSAC implements
+**three planes** — Communication, Resource, Integrity.
+
+**Key technical contributions.**
+- **In-process L4/L7 access control on the DPDK fast path** — a 5-tuple L4 lookup whose cost is
+  **independent of the policy count**, and **byte-bound** L7 inspection (DNS QNAME / application
+  verb) via batched Hyperscan, including **selective per-packet DROP** that keeps the tenant running.
+- **Resource control for the SR-IOV blind spots** — admission screening, runtime API-return
+  override, and a token-bucket **churn** throttle, defending both the *hold* and the *rate* attack.
+- **Tamper-resistant enforcement** — read-only policy/code mappings, a root-owned tamper sentinel,
+  and a fail-closed STOP/CONT start gate so no packet ever flows un-enforced.
+
+---
+
+## B. System Architecture
 
 ```
-eSAC/
-├── Resource_Bank/     host: resource admission gate (quota screen, pre-exec)
-├── bpftime_Loader/    host: ALL host loaders (c_loader + r_loader/r_loader_rate) + syscall-server; inject Agent + load BPF
-├── Policy_Maps/       host: per-tenant RO policy (L4 + resource), generated + loaded into shm
-├── Tamper_Sentinel/   host: root bpftrace, 2-vector (mprotect, openat /proc/self/mem) -> SIGKILL
-└── bpftime_Agent/     tenant (injected): Frida + R_Filter + C_Filter + H_matcher
-    ├── Frida/         installs PMD RX/TX burst hooks + rte_* uprobes
-    ├── R_Filter/      resource-plane BPF: override (NULL/-EAGAIN) + rate throttle
-    ├── C_Filter/      comm-plane L4 mask-probe hash + L7 gate (LLVM-JIT)
-    └── H_matcher/     L7 Hyperscan matcher (uses bpftime ufunc provider) + its RO pattern/payload DBs
+Host (trusted)                                  Tenant process (untrusted, unmodified DPDK app)
+──────────────                                  ───────────────────────────────────────────────
+Resource_Bank   admission gate (pre-exec)       ┌───────────────────────────────────────────┐
+bpftime_Loader  inject agent + load BPF/policy  │  DPDK PMD poll loop (RX/TX burst)           │
+Policy_Maps     per-tenant RO policy -> shm     │    │  Frida hooks (bpftime_Agent/Frida)     │
+Tamper_Sentinel root bpftrace (2-vector)        │    ▼                                        │
+                                                │  bpftime runtime (LLVM-JIT, userspace)      │
+   shared memory  <───── policy / Hyperscan DB ─┤    ├─ C_Filter   L4 5-tuple + L7 gate        │
+   (RO-mapped)                                  │    ├─ H_matcher  L7 Hyperscan (ufunc)        │
+                                                │    └─ R_Filter   resource override + throttle│
+                                                └───────────────────────────────────────────┘
 ```
 
-Convention: **host loaders live under `bpftime_Loader`** (comm `c_loader*` + resource `r_loader*`);
-the **BPF program each injects lives under the Agent submodule that runs it** (`R_Filter`, `C_Filter`);
-admission/policy stays with its plane (`Resource_Bank/esac_admit.sh`).
+```mermaid
+flowchart LR
+  subgraph Host["Host (trusted)"]
+    RB["Resource_Bank<br/>admission gate"]
+    LD["bpftime_Loader<br/>loaders + syscall-server"]
+    PM["Policy_Maps<br/>per-tenant RO policy"]
+    TS["Tamper_Sentinel<br/>root bpftrace (2-vector)"]
+  end
+  subgraph Tenant["Tenant process (unmodified DPDK app)"]
+    PMD["PMD RX/TX burst<br/>(poll loop)"]
+    FR["Frida hooks"]
+    BT["bpftime runtime<br/>(LLVM-JIT, userspace)"]
+    CF["C_Filter<br/>L4 mask-probe + L7 gate"]
+    HM["H_matcher<br/>Hyperscan (ufunc)"]
+    RF["R_Filter<br/>override + throttle"]
+  end
+  SHM[("shared memory<br/>policy + Hyperscan DB<br/>(RO-mapped)")]
 
-### Upstream bpftime vs. eSAC code
+  RB -->|quota ok → exec| Tenant
+  LD -->|inject + load BPF| BT
+  PM --> SHM
+  SHM -. RO .-> CF
+  SHM -. RO .-> HM
+  TS -. watches mprotect/procmem .-> Tenant
+  PMD --> FR --> BT
+  BT --> CF --> HM
+  BT --> RF
+  CF -->|ALLOW forward / DROP free mbuf| PMD
+```
 
-eSAC is **built on, not a fork of, bpftime** (`eunomia-bpf/bpftime`). The large injected runtime —
-`bpftime_Agent/Frida/libbpftime-agent*.so` and `bpftime_Loader/libbpftime-syscall-server.so` — is
-**upstream bpftime**, built from its own source (not in this repo; see BUILD.md) and used as a
-dependency; **Frida-Gum** is bpftime's uprobe backend, also upstream. The **eSAC-authored** code is
-the security logic layered on top: the `R_Filter` / `C_Filter` eBPF programs, the `H_matcher` L7
-matcher, the host `c_loader*` / `r_loader*` loaders, and `Policy_Maps` / `Resource_Bank` /
-`Tamper_Sentinel`. Each eSAC Agent module carries its own `README.md`; upstream components,
-versions and licenses are listed in **[ATTRIBUTION.md](ATTRIBUTION.md)**.
+- **Host ↔ Tenant.** The host screens, launches, and gates each tenant; it loads policy into
+  shared memory, injects the bpftime agent, and runs the (root) tamper sentinel off the tenant's
+  path. The tenant is an *unmodified* DPDK application.
+- **DPDK datapath.** Enforcement runs on the PMD's RX/TX **burst** function — the busiest point of
+  the poll loop — so every packet a tenant sends or receives is inspected without leaving userspace.
+- **Policy + shared memory.** Per-tenant policy (L4 5-tuple table, resource quotas) and the L7
+  Hyperscan match databases live in shared memory, **read-only** mapped into the tenant.
 
-## The three planes
+---
 
-### 1 · Communication control — *who a tenant may talk to*
+## C. Components
 
-**Guards.** Per-tenant network policy on the DPDK datapath: which **5-tuples (L4)** and which
-**application-layer requests** (**L7** — DNS qname, redis verb) a tenant's traffic may carry.
-Actions: **ALLOW / DROP**.
+Directory layout (component names are stable and load-bearing — loaders resolve BPF
+program/section and map names by string):
 
-**Where it runs.** On the driver PMD's RX/TX **burst** function, *inside* the tenant process via
-**bpftime** — Frida installs the hook, the policy BPF runs on bpftime's LLVM-JIT. Executing in
-userspace next to DPDK's poll-mode loop, **the packet hot path never traps into the kernel** (no
-per-packet syscall or context switch).
-
-**How.**
-- **L4 (`C_Filter`).** A 5-tuple policy keyed by `cgroup_id` (per-tenant), resolved with a
-  **mask-probe hash** whose cost is **independent of the policy count** — 2 rules or 16,384 rules
-  scan at the same rate, so a large table does not slow the datapath.
-- **L7 (`C_Filter` gate + `H_matcher`).** For inspectable payloads (DNS / TLS ClientHello /
-  HTTP / redis) the gate content-prescans the burst and hands candidate payloads to
-  **`H_matcher`**. For **DNS**, `H_matcher` **parses the query name (QNAME) out of the wire
-  format**, lowercases it, and matches the **parsed domain** — **case-insensitively and anchored to
-  label boundaries** (`(^|\.)domain$`, i.e. the domain and its subdomains, not an arbitrary
-  substring) — against the pattern DB with **Hyperscan (batched, once per burst)**. This is the
-  same detection semantics as a DNS IDS. Malformed or compressed DNS falls back to a raw-payload
-  scan (see limitations). Cost is **byte-bound**, not ruleset-bound: a realistic ~17 K-pattern DB
-  inspects every packet at a small, bounded overhead.
-
-**Validated** (mlx5 ConnectX-6 Dx, intra VF-to-VF and host-to-host 40 GbE). Two things are kept
-distinct — *detection correctness* and *throughput*:
-
-- **Detection correctness — DNS-aware v2 (current code):** verified by unit test against the
-  17,197-pattern DB: case-insensitive match, label-boundary (domain + subdomain) matching, no
-  substring false-positives, bounds-checked QNAME parse. See **DNS inspection — scope &
-  limitations** below.
-- **Throughput:** with the DB inspecting every packet, eSAC sustains a large fraction of the
-  no-inspection baseline. **Re-measured with v2** (DNS-aware) on the inter-host payload sweep:
-  **≈ 83–101 % of baseline**. ⚠️ The **intra / cc / ka / lcore sweeps and the Suricata comparison
-  were measured with the *previous raw-payload-scan* provider** (historically ≈ 89–96 % of
-  baseline, and **≈ 7.5× a DPDK-IPS/Suricata baseline at 4 matched worker cores**, 9–17× at one
-  core); these are **pending re-measurement against v2** and must not be cited as v2 numbers.
-
-> We report only measured, matched-core ratios; we do **not** extrapolate a fixed
-> "N IPS cores = 1 eSAC core" — the IPS scales sub-linearly (0.39 → 0.73 → 1.11 Mpps at 1/2/4
-> cores), so any single-number core-equivalence projection is unsound.
-
-#### L7 DNS inspection — scope & limitations
-
-`H_matcher`'s DNS path (v2) parses and normalizes the QNAME before matching:
-- **Case:** case-insensitive (`HS_FLAG_CASELESS`) — `EXAMPLE.COM` ≡ `example.com`.
-- **Label boundaries:** anchored `(^|\.)domain$` — matches the domain and its subdomains
-  (`evil.ru`, `a.b.evil.ru`), never an unrelated substring (`xevil.ru.com` does **not** match).
-- **Parse:** QNAME read with bounds checks (`dns_sane` / `dns_clean` / `dns_qname`); trailing bytes
-  after the question (EDNS / padding) are allowed; only the first question's QNAME is parsed.
-- **Limitations (explicit):**
-  - **DNS name compression is not decompressed.** A QNAME containing a `0xC0` compression pointer
-    is treated as not-clean and the packet **falls back to a raw-payload Hyperscan scan**. This
-    fallback is **not** equivalent to proper DNS decompression — a blocked domain whose labels are
-    split across a compression pointer can be missed. (Query QNAMEs are normally uncompressed; this
-    affects only crafted/unusual packets.)
-  - Non-DNS or malformed payloads also take the raw-scan fallback.
-
-#### L7 enforcement — selective per-packet DROP (ALLOW detection vs DROP paths)
-
-eSAC's L7 runs in **two distinct provider paths**; keep them separate when reading results:
-
-| Path | Provider (`.so`) | Patterns | What it does |
+| Component | Side | Role | Source |
 |---|---|---|---|
-| **Detection / ALLOW throughput** | `esac_hs_ufunc.so` (raw / full DNS-aware scan) | **17,197** (`hs_compile_multi`, no cap) | returns a match count; inspects every packet; the ALLOW-throughput + Suricata benchmarks use this path |
-| **Selective per-packet DROP (enforcement)** | `esac_suricata_dns_ufunc.so` | **≤ 256** (`ESAC_HS_MAXPAT`, shm `pat_action[256]`) | sets a per-packet action; the gate drops only matching (malicious) packets |
+| **bpftime_Loader** | host | all host loaders (`c_loader`, `c_loader_rx`, `r_loader`, `r_loader_rate`) + the bpftime syscall-server; inject the agent, load the BPF programs and policy, auto-discover PMD symbols | `bpftime_Loader/src/` |
+| **bpftime_Agent / Frida** | tenant | installs the PMD RX/TX burst hooks and the `rte_*` uprobes (bpftime's Frida-Gum backend) | injected runtime |
+| **bpftime_Agent / C_Filter** | tenant | communication plane eBPF: **L4** 5-tuple policy via a mask-probe hash (`c_filter.bpf.c`) and the **L7 gate** (`c_filter_hs_gate.bpf.c`) | `bpftime_Agent/C_Filter/` |
+| **bpftime_Agent / H_matcher** | tenant | L7 matcher: raw / full DNS-aware Hyperscan scan (`src/esac_hs_ufunc.c`) and the DNS-aware selective-DROP provider (`src/esac_suricata_dns_ufunc.c`); plus the RO match-DB builders (`hsdb_ctl/`), patterns and payloads | `bpftime_Agent/H_matcher/` |
+| **bpftime_Agent / R_Filter** | tenant | resource plane eBPF: API-return **override** (`r_filter.bpf.c`), **quota** (`r_filter_quota.bpf.c`), and token-bucket **rate/churn throttle** (`r_filter_rate.bpf.c`) | `bpftime_Agent/R_Filter/` |
+| **Policy_Maps** | host | per-tenant read-only policy generation (`gen_policy_n.py`, …) loaded into shared memory | `Policy_Maps/` |
+| **Resource_Bank** | host | pre-exec resource admission gate (`esac_admit.sh`) | `Resource_Bank/` |
+| **Tamper_Sentinel** | host | root `bpftrace`, 2-vector (`mprotect(PROT_WRITE)`, `openat /proc/self/mem`) → `SIGKILL`; canonical script `tamper_sentinel_event.sh` | `Tamper_Sentinel/` |
 
-- **Selective DROP mechanism.** Per burst, the gate inspects each packet, **compacts the benign
-  (ALLOW) mbufs to the front and frees only the malicious ones** via `rte_pktmbuf_free_bulk`,
-  returning the kept count. Benign traffic is forwarded; the tenant keeps running (no kill).
-- **bpftime agent dependency.** Selective DROP needs the injected bpftime **agent** to register two
-  ufuncs: `esac_hs_scan` (the matcher, registered **pre-attach**) and `rte_pktmbuf_free_bulk` (mbuf
-  free, registered **post-attach**, once the tenant symbol is globally resolvable). These live in
-  the bpftime source, not this repo — see `~/old/bpftime` branch `esac-l7-free-bulk` (reconstruction
-  commit; the original build tree was lost). `c_filter_hs_gate.bpf.c` here depends on that agent.
-- **Rule-count limit.** The DROP path is capped at **256** patterns by the shared-memory action
-  table; the **17,197**-pattern figure is the **detection / raw-scan** path and does **not** apply
-  to selective DROP.
-- **Burst cap (availability).** The gate inspects at most **128 packets per RX burst** (static
-  `item[128]`/`dropped_ptrs[128]` arrays + a manually-unrolled loop; bpftime has no `bpf_loop`).
-  When the driver returns a burst **larger than 128**, the un-inspected tail is **safe-dropped**
-  (freed, never forwarded) and the tenant survives — it is **not** killed. An earlier version
-  hard-`ACT_KILL`ed oversized bursts, which ended ~50 % of multicore reps under saturating load;
-  the safe-drop is the current behavior. **Fail-closed invariant:** an un-inspectable packet is
-  never forwarded, and if `free_bulk` is unavailable the gate falls back to the original
-  drop-all + kill fail-close.
-- **Verified / unresolved (selective DROP).** 1/2/4-core: benign ALLOW + malicious-only DROP +
-  memory safety (no double-free / UAF / mbuf leak), un-inspected-forwarded = 0 — all verified.
-  The oversized-burst **safe-drop** replaces the kill (availability fix): **offline-verified**
-  (compiles; minimal straight-line change, no new loops); **live NIC re-validation pending**.
+**Relationships.** Host loaders under `bpftime_Loader` inject the agent and load each plane's BPF;
+the BPF program each loader injects lives under the Agent module that runs it (`C_Filter`,
+`R_Filter`). The L7 gate in `C_Filter` calls into `H_matcher` through a bpftime **ufunc**
+(`esac_hs_scan`). Policy and admission stay with their plane (`Policy_Maps`, `Resource_Bank`).
+Upstream components (bpftime, Frida-Gum, Hyperscan, DPDK, libbpf) and their versions/licenses are
+listed in **[ATTRIBUTION.md](ATTRIBUTION.md)**.
 
-### 2 · Resource control (all-block) — *what a tenant may consume*
+### The three planes
 
-**Guards.** The **PF-shared NIC and host resources SR-IOV does *not* isolate**. SR-IOV partitions
-each VF's queues and port, but **not** the hugepage pool, the host allocator, or the NIC's shared
-eSwitch flow-table / firmware steering. One tenant can starve its neighbours two ways:
-- **hold** — grab all of a shared resource (e.g. exhaust the hugepage pool), or
-- **churn** — hammer a control API fast enough that the shared datapath never settles (e.g.
-  create/destroy flow rules so the eSwitch is perpetually rebuilding → a co-tenant's datapath
-  goes to zero).
+- **Communication control — *who a tenant may talk to.*** Per-tenant **L4** (5-tuple) and **L7**
+  (DNS QNAME, application verb) policy on the datapath, actions **ALLOW / DROP**. L4 uses a
+  mask-probe hash keyed by `cgroup_id` whose cost is **independent of the policy count**. L7
+  content-prescans each burst and hands candidate payloads to `H_matcher`, which for DNS parses the
+  QNAME out of the wire format and matches it **case-insensitively, anchored to label boundaries**
+  (`(^|\.)domain$`) against a Hyperscan DB. Matching malicious packets can be **dropped
+  individually** while benign traffic in the same burst is forwarded and the tenant keeps running.
+- **Resource control — *what a tenant may consume.*** Guards the PF-shared NIC and host resources
+  SR-IOV does not isolate. **Admission** refuses to exec an over-quota tenant; **runtime override**
+  rewrites an over-quota `rte_malloc`/`rte_flow_create`/… return to a failure value for the
+  offender only; a **token-bucket throttle** bounds the *rate* of shared control-API churn
+  (`rte_flow_create/destroy`, `rte_malloc`/`rte_free`). Termination is only a backstop.
+- **Integrity — *keeping the enforcement un-removable.*** The patched burst prologue, the JIT
+  pages, and the entire per-tenant policy table (Hyperscan DB included) are `mprotect`'d read-only
+  after install. The only two syscalls that can restore write access —
+  `mprotect(PROT_WRITE)` and `openat("/proc/self/mem")` — are watched by a **root-owned** sentinel
+  that `SIGKILL`s the tenant on attempt. Cross-process tampering also fails
+  (`process_vm_writev` → `EFAULT`, `/dev/mem` root-only, `ptrace` gated by `yama`).
 
-**How — block, don't kill** (termination is only a backstop):
-- **Admission** (`Resource_Bank/esac_admit.sh`) — before EAL starts, the host screens the
-  requested lcores / mempools / memory against the tenant's quota; over-quota ⇒ the process is
-  **never exec'd**.
-- **Runtime override** (`R_Filter`) — an over-quota call that passes admission is **rewritten to a
-  failure value** at the API boundary: `rte_malloc`/`rte_zmalloc`/`rte_memzone_reserve` and
-  `rte_flow_create` → **`NULL`**, others → **`-EAGAIN`**; the allocation fails for the offender only.
-- **Churn throttle** (`R_Filter`, token-bucket) — the *rate* of calls to the shared
-  NIC-control / hugepage-allocator APIs (`rte_flow_create/destroy`, `rte_malloc`/`rte_free`, …) is
-  token-bucketed. This is the defense against the subtle attack above: not *holding* a resource,
-  but re-churning it to keep the shared subsystem permanently rebuilding.
+---
 
-The **blind-spot table** below maps each attack → API → mode → defense.
+## D. Execution Flow
 
-### 3 · Integrity — *keeping the enforcement un-removable*
+1. **Admission** (`Resource_Bank`). Before EAL starts, the host screens the tenant's requested
+   lcores / mempools / memory against its quota. Over-quota ⇒ the process is **never exec'd**.
+2. **Start gate — hold stopped.** The tenant is launched held **`SIGSTOP`** *before* its EAL/PMD
+   begins polling, so there is no un-enforced window.
+3. **Inject + load** (`bpftime_Loader`). The loader injects the bpftime **agent** into the stopped
+   tenant and loads the `C_Filter` / `R_Filter` BPF into shared memory via the syscall-server. The
+   agent registers its ufuncs — `esac_hs_scan` (the matcher) and `rte_pktmbuf_free_bulk` (mbuf
+   bulk-free, used by selective DROP) — and Frida installs the PMD RX/TX hooks and `rte_*` uprobes.
+4. **Policy load** (`Policy_Maps`). The per-tenant policy and the Hyperscan match DBs are placed in
+   shared memory and **RO-mapped** into the tenant.
+5. **Integrity arm** (`Tamper_Sentinel`). RO mappings are applied and the root bpftrace sentinel is
+   watching the two tamper vectors.
+6. **Release — `SIGCONT`.** The tenant resumes; packets begin to flow, now fully enforced.
+7. **Inspect + enforce (per burst).** Each RX/TX burst hook runs `C_Filter` L4 (mask-probe hash),
+   then — for inspectable payloads — the L7 gate prescans and calls `H_matcher`. The verdict is
+   **ALLOW** (forward) or **DROP** (free the mbuf). In parallel, `R_Filter` guards the resource
+   APIs (override / throttle).
 
-**Guards.** The enforcement itself. L4/L7 and resource control only mean something if the tenant
-cannot **peel them off from inside its own process** — it owns its address space and could try to
-rewrite the Frida-patched PMD prologue, the JIT'd policy code, or the policy table.
+---
 
-**How.**
-- **Read-only mapping** (`Policy_Maps` + loader / `H_matcher` hardening) — the patched burst
-  prologue, the bpftime JIT pages, and the **entire** per-tenant policy table (empty slots and the
-  Hyperscan DB included) are `mprotect`'d **read-only** after install; a direct write faults.
-- **Tamper Sentinel** (root `bpftrace`, 2-vector) — the only two syscalls that can *restore* write
-  access to a read-only mapping are `mprotect(PROT_WRITE)` and `openat("/proc/self/mem")`; a
-  **root-owned** sentinel watches exactly these and **`SIGKILL`s** the tenant on attempt. It runs
-  as root, off the tenant's path, so the tenant cannot disable it.
-- **Cross-process tampering also fails** — `process_vm_writev` honors the RO protection
-  (`EFAULT`), `/dev/mem` is root-only under `STRICT_DEVMEM`, and `ptrace` is gated by
-  `yama ptrace_scope=1` (a process may attach only to its own descendants; the host-launched
-  tenant is not the attacker's). Verified on the rig, including a **non-root** attacker.
-- **Fail-closed start-gate (STOP/CONT)** — all hooks and all three integrity mechanisms are
-  installed **while the tenant is held stopped**, before its EAL/PMD begins polling, and only then
-  is it released. No packet flows until every hook and RO mapping is in place — there is no window
-  in which the tenant runs un-enforced.
+## E. Build and Usage
 
-## Resources eSAC guards (SR-IOV blind spots)
+Full details are in **[BUILD.md](BUILD.md)** and **[RUN.md](RUN.md)**; a summary:
 
-| Tenant attacks | via | mode | defense |
-|---|---|---|---|
-| Host **hugepage** memory | `rte_malloc`/`rte_zmalloc`/`rte_memzone_reserve` | hold | override → NULL |
-| Host **hugepage allocator** | `rte_malloc`/`rte_free` | rate (churn) | throttle (token-bucket) |
-| NIC **flow-table** entries | `rte_flow_create` | hold | override → NULL |
-| NIC **firmware / steering** | `rte_flow_*` | rate (churn) | throttle (token-bucket) |
-| Host **lcore / mempool** | `rte_eal_init` / `rte_eal_remote_launch` / `rte_mempool_create` | launch | admission (refuse exec) |
+**Dependencies.** DPDK 22.11+ (with your NIC's PMD), libbpf/libelf/zlib, clang/LLVM 14 (for the
+eBPF objects), Hyperscan (`-lhs`), bpftrace, and the **bpftime** runtime built from source
+(LLVM 15 + Frida backend) with the eSAC patch applied.
 
-per-VF resources (RX/TX queues, the VF's own port) are already isolated by SR-IOV and are **not**
-eSAC's concern — it guards only the **PF-shared NIC** and **host** resources SR-IOV cannot isolate.
+**1. Build the bpftime runtime with the eSAC patch** (the runtime `.so`s are not vendored — they
+exceed GitHub's file-size limit; see **[bpftime-patch/](bpftime-patch/)**):
 
-## Getting started
+```sh
+git clone --recursive https://github.com/eunomia-bpf/bpftime && cd bpftime
+git checkout edcc8ec
+git apply /path/to/eSAC/bpftime-patch/esac-bpftime-edcc8ec.patch
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_DIR=/usr/lib/llvm-15/lib/cmake/llvm \
+  -DBPFTIME_ENABLE_FRIDA=ON -DBPFTIME_BUILD_WITH_LIBBPF=ON
+make -C build bpftime-agent bpftime-syscall-server -j
+# install the agent + syscall-server .so per BUILD.md §2
+```
 
-- **[BUILD.md](BUILD.md)** — prerequisites (DPDK, bpftime, Hyperscan, libbpf) and how to build
-  each component. The large third-party **bpftime** runtime `.so` files are **not** in this repo
-  (they exceed GitHub's file-size limit); BUILD.md shows how to produce them.
-- **[RUN.md](RUN.md)** — runnable demos. Two run on **any Linux host** (Tamper-Sentinel KILL,
-  resource admission DENY); the datapath DROP / throttle demos need a DPDK-capable NIC
-  (validated on Mellanox ConnectX-6 Dx, mlx5 switchdev VF-to-VF).
+**2. Build eSAC** (loaders, eBPF objects, H_matcher, DB tools) — see BUILD.md §3–§5, e.g.:
 
-## What is built vs. committed
+```sh
+gcc bpftime_Loader/src/c_loader.c -o bpftime_Loader/c_loader -lbpf -lelf -lz
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I bpftime_Agent/C_Filter \
+  -c bpftime_Agent/C_Filter/c_filter_hs_gate.bpf.c -o bpftime_Agent/C_Filter/c_filter_hs_gate.bpf.o
+gcc -shared -fPIC -O2 bpftime_Agent/H_matcher/src/esac_hs_ufunc.c \
+  -o bpftime_Agent/H_matcher/esac_hs_ufunc.so -lhs
+```
 
-This repository commits **source, build scripts, and config only** — compiled artifacts are **not**
-tracked in git (they are rebuilt with [BUILD.md](BUILD.md)). This covers the loaders
-(`c_loader`, `c_loader_rx`, `r_loader`, `r_loader_rate`), the `*.bpf.o` eBPF objects, the L7
-`H_matcher/esac_hs_ufunc.so` + `esac_suricata_dns_ufunc.so`, and the Hyperscan-DB builders
-`H_matcher/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. The large third-party bpftime runtime
-(`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled Tamper-Sentinel
-C++ binaries are likewise not committed (the canonical sentinel is the bpftrace script
-`Tamper_Sentinel/tamper_sentinel_event.sh`, which needs no build).
+**3. Configure policy** with `Policy_Maps/gen_policy_n.py` (per-tenant L4 / resource policy).
 
-> Two binaries are **still tracked** because their source is not yet in the repo and no rebuild
-> recipe exists: `bpftime_Loader/c_loader_tx` (an egress-TX loader applied as a binary patch) and
-> `bpftime_Agent/R_Filter/r_filter_monitor.bpf.o`. These are flagged to be sourced or dropped
-> before a clean source-only release.
+**4. Run.** `RUN.md` has runnable demos: the **Tamper-Sentinel KILL** and **resource admission
+DENY** demos run on **any Linux host**; the datapath **DROP / throttle** demos need a DPDK-capable
+NIC (validated on Mellanox ConnectX-6 Dx, mlx5 switchdev VF-to-VF). `tools/deploy.sh` builds the
+eSAC artifacts and installs them into an experiment rig (preserving the upstream bpftime runtime).
 
-## Attaching to stripped stock DPDK apps (auto debug-symbol discovery)
+---
 
-`c_loader`'s driver-level RX/TX hooks resolve the PMD burst symbols (e.g. `mlx5_rx_burst*`)
-by file offset. When the target app links a **stripped** DPDK (as distro packages do), those
-symbols are absent from the loaded `.so`. If a matching separate debug file is installed
-(`/usr/lib/debug/.build-id/XX/YYY.debug`, e.g. from a distro `-dbg`/`dbgsym` package),
-`c_loader` now **auto-discovers it via the .so's GNU build-id**, resolves the offsets from the
-debug file, and attaches the uprobe to the real loaded `.so`. No manual `--pmd-debug-lib` is
-needed (pass it only to override); when the symbols are already visible (non-stripped build),
-discovery is skipped.
+## F. Evaluation
+
+Representative results only — the full sweeps live in the experiment-results documents, not here.
+eSAC was validated on a Mellanox ConnectX-6 Dx (mlx5) rig, intra VF-to-VF and host-to-host 40 GbE.
+
+| Plane | Metric | Representative result |
+|---|---|---|
+| **L4** | datapath overhead (RX) | ≈ no-inspection baseline (single-digit % or less) |
+| **L7** | throughput vs no-inspection baseline (raw-scan detection, 17,197 patterns) | **≈ 89–96 %** (intra, per core) |
+| **L7** | vs a DPDK-IPS / Suricata baseline | **≈ 9–17× per core** (1 core), **≈ 7.5× at 4 matched cores** |
+| **L7** | multicore scaling | tracks the baseline by 2 cores; the IPS baseline scales sub-linearly |
+
+> **Two L7 paths, kept distinct.** The throughput and Suricata numbers above are the **raw-scan /
+> full-payload detection** path (**17,197**-pattern Hyperscan DB). The **DNS-aware selective-DROP**
+> enforcement path is a separate provider capped at **≤ 256** patterns; its per-packet DROP is
+> verified functionally (benign ALLOW + malicious-only DROP + memory safety at 1/2/4 cores) and is
+> **not** a throughput figure. Do not mix the two.
+
+We report only measured, matched-core ratios and do **not** extrapolate a fixed
+"N IPS cores = 1 eSAC core" — the IPS baseline scales sub-linearly, so such a single number is
+unsound. Detailed per-payload / per-cc / per-core tables are in the experiment-results documents.
+
+---
+
+## G. Implementation Details
+
+- **In-process, no kernel trap on the hot path.** Policy runs on bpftime's LLVM-JIT in userspace
+  on the PMD burst function; there is no per-packet syscall or context switch.
+- **Policy-count-independent L4.** The 5-tuple lookup uses a mask-probe hash, so a 2-rule and a
+  16,384-rule table scan at the same rate.
+- **Byte-bound L7.** The Hyperscan scan is batched once per burst over the candidate payloads; cost
+  grows with bytes inspected, not with the ruleset size.
+- **Per-burst inspection bound.** bpftime has no `bpf_loop` helper and its verifier cannot load a
+  backward-branch loop, so the per-burst packet loop is manually unrolled over a fixed bound
+  (128 packets, matching the static batch arrays). If a driver burst exceeds that bound, the
+  excess (un-inspectable) packets are **dropped** rather than forwarded; for the burst sizes
+  common in DPDK experiments (32 or 64) the bound is not reached, so it is sufficient for the
+  current research scope.
+- **Fail-closed start gate.** All hooks, the RO mappings, and the tamper sentinel are installed
+  while the tenant is `SIGSTOP`'d; the tenant is released only once enforcement is fully in place.
+- **bpftime dependency.** eSAC's agent-side additions to bpftime (the `esac_hs_scan` and
+  `rte_pktmbuf_free_bulk` ufunc registrations and the RX-hook fixes) are shipped as a reproducible
+  patch in **[bpftime-patch/](bpftime-patch/)** against upstream commit `edcc8ec`.
+
+---
+
+## Repository notes
+
+This repository commits **source, build scripts, and config only** — compiled artifacts (`*.so`,
+`*.bpf.o`, the loaders, the Hyperscan tools) are rebuilt via **[BUILD.md](BUILD.md)** and are not
+tracked. The large upstream bpftime runtime `.so` files are likewise not committed (they exceed
+GitHub's limit). See **[ATTRIBUTION.md](ATTRIBUTION.md)** for upstream components and licenses, and
+**[CLAUDE.md](CLAUDE.md)** for repository maintenance conventions.
