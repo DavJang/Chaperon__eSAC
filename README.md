@@ -94,6 +94,39 @@ distinct — *detection correctness* and *throughput*:
     affects only crafted/unusual packets.)
   - Non-DNS or malformed payloads also take the raw-scan fallback.
 
+#### L7 enforcement — selective per-packet DROP (ALLOW detection vs DROP paths)
+
+eSAC's L7 runs in **two distinct provider paths**; keep them separate when reading results:
+
+| Path | Provider (`.so`) | Patterns | What it does |
+|---|---|---|---|
+| **Detection / ALLOW throughput** | `esac_hs_ufunc.so` (raw / full DNS-aware scan) | **17,197** (`hs_compile_multi`, no cap) | returns a match count; inspects every packet; the ALLOW-throughput + Suricata benchmarks use this path |
+| **Selective per-packet DROP (enforcement)** | `esac_suricata_dns_ufunc.so` | **≤ 256** (`ESAC_HS_MAXPAT`, shm `pat_action[256]`) | sets a per-packet action; the gate drops only matching (malicious) packets |
+
+- **Selective DROP mechanism.** Per burst, the gate inspects each packet, **compacts the benign
+  (ALLOW) mbufs to the front and frees only the malicious ones** via `rte_pktmbuf_free_bulk`,
+  returning the kept count. Benign traffic is forwarded; the tenant keeps running (no kill).
+- **bpftime agent dependency.** Selective DROP needs the injected bpftime **agent** to register two
+  ufuncs: `esac_hs_scan` (the matcher, registered **pre-attach**) and `rte_pktmbuf_free_bulk` (mbuf
+  free, registered **post-attach**, once the tenant symbol is globally resolvable). These live in
+  the bpftime source, not this repo — see `~/old/bpftime` branch `esac-l7-free-bulk` (reconstruction
+  commit; the original build tree was lost). `c_filter_hs_gate.bpf.c` here depends on that agent.
+- **Rule-count limit.** The DROP path is capped at **256** patterns by the shared-memory action
+  table; the **17,197**-pattern figure is the **detection / raw-scan** path and does **not** apply
+  to selective DROP.
+- **Burst cap (availability).** The gate inspects at most **128 packets per RX burst** (static
+  `item[128]`/`dropped_ptrs[128]` arrays + a manually-unrolled loop; bpftime has no `bpf_loop`).
+  When the driver returns a burst **larger than 128**, the un-inspected tail is **safe-dropped**
+  (freed, never forwarded) and the tenant survives — it is **not** killed. An earlier version
+  hard-`ACT_KILL`ed oversized bursts, which ended ~50 % of multicore reps under saturating load;
+  the safe-drop is the current behavior. **Fail-closed invariant:** an un-inspectable packet is
+  never forwarded, and if `free_bulk` is unavailable the gate falls back to the original
+  drop-all + kill fail-close.
+- **Verified / unresolved (selective DROP).** 1/2/4-core: benign ALLOW + malicious-only DROP +
+  memory safety (no double-free / UAF / mbuf leak), un-inspected-forwarded = 0 — all verified.
+  The oversized-burst **safe-drop** replaces the kill (availability fix): **offline-verified**
+  (compiles; minimal straight-line change, no new loops); **live NIC re-validation pending**.
+
 ### 2 · Resource control (all-block) — *what a tenant may consume*
 
 **Guards.** The **PF-shared NIC and host resources SR-IOV does *not* isolate**. SR-IOV partitions
