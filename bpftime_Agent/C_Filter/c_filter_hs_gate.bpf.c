@@ -1081,12 +1081,21 @@ int BPF_URETPROBE(uretprobe_rx_burst_drv, unsigned short ret)
 
     __u32 qsk = qkey(0, 0);
     __u16 drops = parse_and_apply(a->rx_pkts_ptr, n, cg_id, qsk, &pr, 1);
-    if (ret > n) pr.failed = 1;
+    /* eSAC burst-cap safe-drop: ret = the driver's real burst size; the gate can inspect only
+     * the first n (<=128, bounded by the static item[]/dropped_ptrs[] arrays and the manually
+     * unrolled loop). The un-inspected tail [n..ret-1] must NEVER be delivered. Previously an
+     * oversized burst (ret>n) under enforcement was a hard ACT_KILL (availability loss).
+     * Instead we fail CLOSED by DROPPING: free the malicious packets found in the inspected
+     * prefix AND free the un-inspected tail, capping delivery to the inspected prefix. No
+     * un-inspected packet is ever forwarded, and the tenant survives. Only a genuine inspection
+     * failure (read error / missing scratch) or an unavailable free_bulk keeps the original
+     * retval=0 + ACT_KILL fail-close -- so we never leak and never pass un-inspected traffic. */
     if (pr.failed && (RCFG.features & FEAT_ENFORCEMENT)) {
         bpf_set_retval(0);
-        pr.worst = ACT_KILL;
+        pr.worst = ACT_KILL;                 /* inspection failed -> fail-close */
     }
-    if (!pr.failed && pr.dropped) {
+    __u8 oversized = (ret > n);
+    if (!pr.failed && (pr.dropped || oversized) && (RCFG.features & FEAT_ENFORCEMENT)) {
         struct pkt_scratch *scratch = bpf_map_lookup_elem(&pkt_scratch_map, &z);
         if (scratch) {
             volatile char free_name[22];
@@ -1100,13 +1109,24 @@ int BPF_URETPROBE(uretprobe_rx_burst_drv, unsigned short ret)
             free_name[21]=0;
             long id = ufunc_find_func_id((const char *)free_name);
             if (id >= 0) {
-                if (bpf_set_retval(pr.kept) == 0)
-                    UFUNC_CALL_2(id, scratch->dropped_ptrs, pr.dropped);
-                else pr.worst = ACT_KILL;
+                /* free malicious packets detected in the inspected prefix (compacted) */
+                if (pr.dropped) {
+                    if (bpf_set_retval(pr.kept) == 0)
+                        UFUNC_CALL_2(id, scratch->dropped_ptrs, pr.dropped);
+                    else pr.worst = ACT_KILL;
+                }
+                /* oversized: free the un-inspected tail [n..ret-1], deliver only the first n */
+                if (oversized) {
+                    UFUNC_CALL_2(id, a->rx_pkts_ptr + (__u64)n * 8, (__u64)(ret - n));
+                    if (!pr.dropped) bpf_set_retval(n);
+                }
             } else {
                 bpf_set_retval(0);
-                pr.worst = ACT_KILL;
+                pr.worst = ACT_KILL;         /* free_bulk unavailable -> safe fail-close */
             }
+        } else if (oversized) {
+            bpf_set_retval(0);
+            pr.worst = ACT_KILL;             /* no scratch -> cannot free tail -> fail-close */
         }
     }
 
