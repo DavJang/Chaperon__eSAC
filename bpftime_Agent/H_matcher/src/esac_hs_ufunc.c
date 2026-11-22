@@ -19,6 +19,41 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <dlfcn.h>
+
+/* ---- dlsym-visible rte_pktmbuf_free_bulk shim (for the L7 per-packet DROP path) ----
+ * The tenant's rte_pktmbuf_free_bulk is statically linked and NOT resolvable via
+ * dlsym(RTLD_DEFAULT) at bpftime-agent-init time (verified: nil early, found late), so the
+ * agent skips registering it and the C_Filter gate fail-closes to ACT_KILL on an L7 match.
+ * This provider .so is already in scope at agent-init (it also exports esac_hs_scan), so a
+ * same-named shim here IS found -> the agent registers it as the `rte_pktmbuf_free_bulk` ufunc.
+ * At CALL time (gate dropping packets, late) it lazily resolves the REAL symbol from the MAIN
+ * program handle and forwards. The tenant's own calls are static/direct and unaffected; this
+ * shim is only reached via the ufunc call path / dlsym, never the tenant's internal calls. */
+uint64_t esac_hs_scan(const void *batch, uint32_t count);   /* fwd decl: stable symbol in THIS .so */
+
+__attribute__((visibility("default")))
+void rte_pktmbuf_free_bulk(void **mbufs, unsigned int count)
+{
+    static void (*real_fb)(void **, unsigned int) = NULL;
+    if (!real_fb) {
+        void *mainh = dlopen(NULL, RTLD_NOW);                 /* main program (tenant) symbols */
+        if (mainh) {
+            void *s = dlsym(mainh, "rte_pktmbuf_free_bulk");
+            Dl_info si, mi;
+            /* accept s only if it lives in a DIFFERENT object than this provider .so
+             * (robust against symbol interposition — never forwards to our own shim). */
+            if (s && dladdr(s, &si) && dladdr((void *)&esac_hs_scan, &mi)
+                && si.dli_fname && mi.dli_fname
+                && strcmp(si.dli_fname, mi.dli_fname) != 0)
+                real_fb = (void (*)(void **, unsigned int))s;
+        }
+    }
+    if (real_fb) real_fb(mbufs, count);
+    /* if still unresolved: no-op. The dropped mbufs were already excluded from the burst by
+     * the gate's compaction (never returned to the app), so there is no use-after-free; the
+     * only risk is a transient leak, which the gate's cap-based fail-close already bounds. */
+}
 
 #define PAGE 4096UL
 static unsigned long pdown(unsigned long a){ return a & ~(PAGE-1); }

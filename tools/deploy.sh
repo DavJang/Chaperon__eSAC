@@ -44,7 +44,7 @@ build_all(){
     gcc "$SRC/bpftime_Loader/src/$l.c" -o "$SRC/bpftime_Loader/$l" -lbpf -lelf -lz
   done
   local HSI="-I $A/H_matcher/hsdb_ctl/src"
-  gcc -shared -fPIC -O2 $HSI "$A/H_matcher/src/esac_hs_ufunc.c" -o "$A/H_matcher/esac_hs_ufunc.so" -lhs
+  gcc -shared -fPIC -O2 $HSI "$A/H_matcher/src/esac_hs_ufunc.c" -o "$A/H_matcher/esac_hs_ufunc.so" -lhs -ldl
   gcc -shared -fPIC -O2 $HSI "$A/H_matcher/src/esac_suricata_dns_ufunc.c" -o "$A/H_matcher/esac_suricata_dns_ufunc.so" -lhs -lrt \
     || echo "[deploy] WARN: esac_suricata_dns_ufunc.so (secondary) failed; continuing"
   gcc $HSI "$A/H_matcher/hsdb_ctl/src/esac_hs_ctl_rx.c"    -o "$A/H_matcher/hsdb_ctl/esac_hs_ctl_rx"    -lhs
