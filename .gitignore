@@ -12,3 +12,17 @@ Tamper_Sentinel/bin/tamper_sentinel_cgroup
 # backups / runtime artifacts
 *.bak*
 results/
+
+# --- compiled artifacts (rebuild per BUILD.md; source is committed) ---
+*.so
+*.rawscan-bak
+bpftime_Agent/**/*.bpf.o
+bpftime_Loader/c_loader
+bpftime_Loader/c_loader_rx
+bpftime_Loader/r_loader
+bpftime_Loader/r_loader_rate
+bpftime_Agent/H_matcher/hsdb_ctl/esac_hs_ctl_rx
+bpftime_Agent/H_matcher/hsdb_ctl/esac_dom_ctl_bulk
+# keep binaries whose SOURCE is not in the repo (flagged -- rebuild recipe unavailable)
+!bpftime_Loader/c_loader_tx
+!bpftime_Agent/R_Filter/r_filter_monitor.bpf.o

@@ -22,6 +22,17 @@ Convention: **host loaders live under `bpftime_Loader`** (comm `c_loader*` + res
 the **BPF program each injects lives under the Agent submodule that runs it** (`R_Filter`, `C_Filter`);
 admission/policy stays with its plane (`Resource_Bank/esac_admit.sh`).
 
+### Upstream bpftime vs. eSAC code
+
+eSAC is **built on, not a fork of, bpftime** (`eunomia-bpf/bpftime`). The large injected runtime —
+`bpftime_Agent/Frida/libbpftime-agent*.so` and `bpftime_Loader/libbpftime-syscall-server.so` — is
+**upstream bpftime**, built from its own source (not in this repo; see BUILD.md) and used as a
+dependency; **Frida-Gum** is bpftime's uprobe backend, also upstream. The **eSAC-authored** code is
+the security logic layered on top: the `R_Filter` / `C_Filter` eBPF programs, the `H_matcher` L7
+matcher, the host `c_loader*` / `r_loader*` loaders, and `Policy_Maps` / `Resource_Bank` /
+`Tamper_Sentinel`. Each eSAC Agent module carries its own `README.md`; upstream components,
+versions and licenses are listed in **[ATTRIBUTION.md](ATTRIBUTION.md)**.
+
 ## The three planes
 
 ### 1 · Communication control — *who a tenant may talk to*
@@ -41,15 +52,47 @@ per-packet syscall or context switch).
   scan at the same rate, so a large table does not slow the datapath.
 - **L7 (`C_Filter` gate + `H_matcher`).** For inspectable payloads (DNS / TLS ClientHello /
   HTTP / redis) the gate content-prescans the burst and hands candidate payloads to
-  **`H_matcher`**, which runs **Hyperscan once per burst (batched)** over the *real* payload bytes.
-  Cost is **byte-bound**, not ruleset-bound: a realistic ~17 K-pattern DB inspects every packet at
-  a small, bounded overhead.
+  **`H_matcher`**. For **DNS**, `H_matcher` **parses the query name (QNAME) out of the wire
+  format**, lowercases it, and matches the **parsed domain** — **case-insensitively and anchored to
+  label boundaries** (`(^|\.)domain$`, i.e. the domain and its subdomains, not an arbitrary
+  substring) — against the pattern DB with **Hyperscan (batched, once per burst)**. This is the
+  same detection semantics as a DNS IDS. Malformed or compressed DNS falls back to a raw-payload
+  scan (see limitations). Cost is **byte-bound**, not ruleset-bound: a realistic ~17 K-pattern DB
+  inspects every packet at a small, bounded overhead.
 
-**Validated** (mlx5 ConnectX-6 Dx, intra VF-to-VF and host-to-host 40 GbE): with a 17,000-pattern
-Hyperscan DB fully scanning every payload, eSAC sustains **≈ 89–96 % of the no-inspection
-baseline** (the residual cost is masked by link rate at large payloads), while a conventional IPS
-on the same traffic runs **1–2 orders of magnitude slower per core** — one eSAC core ≈ ~20 IPS
-cores.
+**Validated** (mlx5 ConnectX-6 Dx, intra VF-to-VF and host-to-host 40 GbE). Two things are kept
+distinct — *detection correctness* and *throughput*:
+
+- **Detection correctness — DNS-aware v2 (current code):** verified by unit test against the
+  17,197-pattern DB: case-insensitive match, label-boundary (domain + subdomain) matching, no
+  substring false-positives, bounds-checked QNAME parse. See **DNS inspection — scope &
+  limitations** below.
+- **Throughput:** with the DB inspecting every packet, eSAC sustains a large fraction of the
+  no-inspection baseline. **Re-measured with v2** (DNS-aware) on the inter-host payload sweep:
+  **≈ 83–101 % of baseline**. ⚠️ The **intra / cc / ka / lcore sweeps and the Suricata comparison
+  were measured with the *previous raw-payload-scan* provider** (historically ≈ 89–96 % of
+  baseline, and **≈ 7.5× a DPDK-IPS/Suricata baseline at 4 matched worker cores**, 9–17× at one
+  core); these are **pending re-measurement against v2** and must not be cited as v2 numbers.
+
+> We report only measured, matched-core ratios; we do **not** extrapolate a fixed
+> "N IPS cores = 1 eSAC core" — the IPS scales sub-linearly (0.39 → 0.73 → 1.11 Mpps at 1/2/4
+> cores), so any single-number core-equivalence projection is unsound.
+
+#### L7 DNS inspection — scope & limitations
+
+`H_matcher`'s DNS path (v2) parses and normalizes the QNAME before matching:
+- **Case:** case-insensitive (`HS_FLAG_CASELESS`) — `EXAMPLE.COM` ≡ `example.com`.
+- **Label boundaries:** anchored `(^|\.)domain$` — matches the domain and its subdomains
+  (`evil.ru`, `a.b.evil.ru`), never an unrelated substring (`xevil.ru.com` does **not** match).
+- **Parse:** QNAME read with bounds checks (`dns_sane` / `dns_clean` / `dns_qname`); trailing bytes
+  after the question (EDNS / padding) are allowed; only the first question's QNAME is parsed.
+- **Limitations (explicit):**
+  - **DNS name compression is not decompressed.** A QNAME containing a `0xC0` compression pointer
+    is treated as not-clean and the packet **falls back to a raw-payload Hyperscan scan**. This
+    fallback is **not** equivalent to proper DNS decompression — a blocked domain whose labels are
+    split across a compression pointer can be missed. (Query QNAMEs are normally uncompressed; this
+    affects only crafted/unusual packets.)
+  - Non-DNS or malformed payloads also take the raw-scan fallback.
 
 ### 2 · Resource control (all-block) — *what a tenant may consume*
 
@@ -120,14 +163,21 @@ eSAC's concern — it guards only the **PF-shared NIC** and **host** resources S
   resource admission DENY); the datapath DROP / throttle demos need a DPDK-capable NIC
   (validated on Mellanox ConnectX-6 Dx, mlx5 switchdev VF-to-VF).
 
-## What is prebuilt here vs. built by you
+## What is built vs. committed
 
-Shipped prebuilt (small, but linked for the validation rig's DPDK — rebuild for your own):
-`c_loader`, `c_loader_rx` (RX-only datapath loader), `c_loader_tx`, `r_loader`, `r_loader_rate`, the `*.bpf.o` eBPF objects,
-`H_matcher/esac_hs_ufunc.so`, and the L7 Hyperscan-DB builders `H_matcher/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. **Not shipped** (build per BUILD.md): the bpftime runtime
-(`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled
-Tamper-Sentinel C++ binaries (the canonical sentinel is the bpftrace script
+This repository commits **source, build scripts, and config only** — compiled artifacts are **not**
+tracked in git (they are rebuilt with [BUILD.md](BUILD.md)). This covers the loaders
+(`c_loader`, `c_loader_rx`, `r_loader`, `r_loader_rate`), the `*.bpf.o` eBPF objects, the L7
+`H_matcher/esac_hs_ufunc.so` + `esac_suricata_dns_ufunc.so`, and the Hyperscan-DB builders
+`H_matcher/hsdb_ctl/{esac_hs_ctl_rx, esac_dom_ctl_bulk}`. The large third-party bpftime runtime
+(`libbpftime-agent*.so`, `libbpftime-syscall-server.so`) and the optional compiled Tamper-Sentinel
+C++ binaries are likewise not committed (the canonical sentinel is the bpftrace script
 `Tamper_Sentinel/tamper_sentinel_event.sh`, which needs no build).
+
+> Two binaries are **still tracked** because their source is not yet in the repo and no rebuild
+> recipe exists: `bpftime_Loader/c_loader_tx` (an egress-TX loader applied as a binary patch) and
+> `bpftime_Agent/R_Filter/r_filter_monitor.bpf.o`. These are flagged to be sourced or dropped
+> before a clean source-only release.
 
 ## Attaching to stripped stock DPDK apps (auto debug-symbol discovery)
 
