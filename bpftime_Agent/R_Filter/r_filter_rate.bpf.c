@@ -63,3 +63,34 @@ int BPF_UPROBE(mem_quota_ptr)
     bpf_printk("MEMGOV ALLOW pid=%u count=%llu", pid, m->count);
     return 0;
 }
+
+/* ===== 2026-11-25 ADD: SINGLE-CALL-ALLOW (monotonic counter, reuses mem_quota_ptr pattern) =====
+ * Paper method: admit the FIRST CALL_QUOTA control-plane calls per tenant, then DENY all further
+ * calls (no time-based replenishment, unlike the token bucket above). Pointed by the loader config
+ * at rte_eth_dev_start (port restart) and rte_eth_dev_set_mc_addr_list (multicast update).
+ * Existing cp_rate_ptr/cp_rate_int/mem_quota_ptr are UNCHANGED. */
+const volatile __u64 CALL_QUOTA = 1;   /* allow this many CP calls per tenant, then deny */
+struct cq { __u64 count; __u64 denied; };
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
+         __type(key, __u32); __type(value, struct cq); } cq_state SEC(".maps");
+
+/* returns 1 if OVER quota (caller overrides), 0 if allowed */
+static __always_inline int over_callquota(void)
+{
+    __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    struct cq *s = bpf_map_lookup_elem(&cq_state, &pid);
+    if (!s) { struct cq i = {}; i.count = 1;
+        bpf_map_update_elem(&cq_state, &pid, &i, BPF_ANY);
+        bpf_printk("CALLQ ALLOW pid=%u count=1", pid); return 0; }
+    if (s->count >= CALL_QUOTA) { s->denied++;
+        bpf_printk("CALLQ DENY(quota) pid=%u over=%llu", pid, CALL_QUOTA); return 1; }
+    s->count++;
+    bpf_printk("CALLQ ALLOW pid=%u count=%llu", pid, s->count); return 0;
+}
+
+/* int-returning CP APIs (rte_eth_dev_start, rte_eth_dev_set_mc_addr_list): deny -> -EAGAIN */
+SEC("uprobe/cp_call_quota_int")
+int BPF_UPROBE(cp_call_quota_int) { if (over_callquota()) bpf_override_return(ctx, (__u64)(-11)); return 0; }
+/* ptr-returning CP APIs: deny -> NULL */
+SEC("uprobe/cp_call_quota_ptr")
+int BPF_UPROBE(cp_call_quota_ptr) { if (over_callquota()) bpf_override_return(ctx, 0); return 0; }
