@@ -18,6 +18,7 @@ PID=${1:?target pid}
 CORE=${2:-10}
 BT='tracepoint:syscalls:sys_enter_mprotect /pid=='"$PID"' && (args->prot & 2)/ { printf("[TAMPER_SENTINEL] mprotect_rw pid=%d\n",pid); signal(9); }
 tracepoint:syscalls:sys_enter_pkey_mprotect /pid=='"$PID"' && (args->prot & 2)/ { printf("[TAMPER_SENTINEL] pkey_mprotect_rw pid=%d\n",pid); signal(9); }
+tracepoint:syscalls:sys_enter_execve /pid=='"$PID"'/ { printf("[TAMPER_SENTINEL] execve pid=%d\n",pid); signal(9); }
 tracepoint:syscalls:sys_enter_openat /pid=='"$PID"'/ { $fn=str(args->filename); if($fn=="/proc/self/mem"){ printf("[TAMPER_SENTINEL] procmem pid=%d\n",pid); signal(9); } }
 kprobe:mem_open /pid=='"$PID"'/ { printf("[TAMPER_SENTINEL] procmem_handler pid=%d\n",pid); signal(9); }'
 exec sudo -n taskset -c "$CORE" bpftrace --unsafe -e "$BT"
