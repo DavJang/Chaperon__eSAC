@@ -1,0 +1,36 @@
+diff --git a/src/compiler.cpp b/src/compiler.cpp
+index 3ec98b9..ec6dc29 100644
+--- a/src/compiler.cpp
++++ b/src/compiler.cpp
+@@ -541,13 +541,13 @@ Expected<ThreadSafeModule> llvm_bpf_jit_context::generateModule(
+ 						  builder.getInt64(5)),
+ 				callItemCnt);
+ 			// Restore data stack
+-			// r10 += stack_size
++			// r10 is a byte address; restore one full 512-byte eBPF frame.
+ 			builder.CreateStore(
+ 				builder.CreateAdd(
+ 					builder.CreateLoad(
+ 						builder.getInt64Ty(),
+ 						regs[10]),
+-					builder.getInt64(STACK_SIZE)),
++					builder.getInt64(EBPF_STACK_SIZE)),
+ 				regs[10]);
+ 			auto indrBr = builder.CreateIndirectBr(targetAddr);
+ 			for (const auto &item : localFuncRetBlks) {
+@@ -1403,13 +1403,13 @@ this conversion.
+ 									4)) }));
+ 				}
+ 				// Move data stack
+-				// r10 -= stackSize
++				// r10 is a byte address; reserve one full eBPF frame.
+ 				builder.CreateStore(
+ 					builder.CreateSub(
+ 						builder.CreateLoad(
+ 							builder.getInt64Ty(),
+ 							regs[10]),
+-						builder.getInt64(STACK_SIZE)),
++						builder.getInt64(EBPF_STACK_SIZE)),
+ 					regs[10]);
+ 				if (auto dstBlk = loadCallDstBlock(pc, inst,
+ 								   instBlocks);

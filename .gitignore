@@ -1,28 +1,47 @@
-# Large third-party bpftime runtime (each ~100 MB, over GitHub's file limit) -- build per BUILD.md
-bpftime_Agent/Frida/libbpftime-agent.so
-bpftime_Agent/Frida/libbpftime-agent-transformer.so
-bpftime_Agent/H_matcher/libbpftime-agent-hs.so
-bpftime_Loader/libbpftime-syscall-server.so
+# ---- host-local files (never commit) ----
+/CLAUDE.md
+/internal/
+manager/chap_env.sh
 
-# Large compiled Tamper-Sentinel C++ binaries -- canonical sentinel is the bpftrace script
-# Tamper_Sentinel/tamper_sentinel_event.sh (no build needed)
-Tamper_Sentinel/bin/tamper_sentinel
-Tamper_Sentinel/bin/tamper_sentinel_cgroup
-
-# backups / runtime artifacts
-*.bak*
-results/
-
-# --- compiled artifacts (rebuild per BUILD.md; source is committed) ---
+# ---- build outputs (rebuild from source, see docs/BUILD.md) ----
+*.o
 *.so
-*.rawscan-bak
-bpftime_Agent/**/*.bpf.o
-bpftime_Loader/c_loader
-bpftime_Loader/c_loader_rx
-bpftime_Loader/r_loader
-bpftime_Loader/r_loader_rate
-bpftime_Agent/H_matcher/hsdb_ctl/esac_hs_ctl_rx
-bpftime_Agent/H_matcher/hsdb_ctl/esac_dom_ctl_bulk
-# keep binaries whose SOURCE is not in the repo (flagged -- rebuild recipe unavailable)
-!bpftime_Loader/c_loader_tx
-!bpftime_Agent/R_Filter/r_filter_monitor.bpf.o
+*.a
+agent/build/
+manager/chaperon_loader
+manager/tools/amblaunch
+communication/chap_policy_flip
+resource/agent/fd_broker_multi
+resource/kernel/rs_sentinel_reuse
+resource/kernel/rs_concurrency_test
+resource/manager/chap_res_policy
+integrity/kernel/integ_sentinel_run
+integrity/kernel/integ_setranges
+integrity/kernel/tamper_child
+tests/gen/esac_l47gen
+tests/reqI/dispatch_unit_test
+tests/reqI/dispatch_structs.inc
+tests/reqI/dispatch_excl.inc
+tests/reqI/lookup64_unit_test
+tests/unit/policy_writer_conc_test
+tests/unit/seqlock_failclosed_test
+tests/unit/torn_stress
+tests/unit/hash_audit
+tests/unit/hs_ufunc_failclosed_test
+
+# ---- experiment outputs, logs, dumps ----
+results/
+*.log
+*.progress
+*.output
+tests/reqI/resapi_matrix_summary.txt
+core
+core.*
+vgcore.*
+*.pcap
+*.pcapng
+perf.data*
+__pycache__/
+*.pyc
+*.swp
+*~

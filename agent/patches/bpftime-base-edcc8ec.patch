@@ -1,0 +1,485 @@
+diff --git a/attach/frida_uprobe_attach_impl/src/frida_internal_attach_entry.cpp b/attach/frida_uprobe_attach_impl/src/frida_internal_attach_entry.cpp
+index b618e31..9a62591 100644
+--- a/attach/frida_uprobe_attach_impl/src/frida_internal_attach_entry.cpp
++++ b/attach/frida_uprobe_attach_impl/src/frida_internal_attach_entry.cpp
+@@ -5,6 +5,8 @@
+ #include <spdlog/fmt/fmt.h>
+ #include <spdlog/spdlog.h>
+ #include <frida_register_conversion.hpp>
++#include <exception>
++#include <utility>
+ using namespace bpftime::attach;
+ 
+ extern "C" uint64_t __bpftime_frida_attach_manager__replace_handler();
+@@ -314,5 +316,21 @@ static void uprobe_listener_on_leave(GumInvocationContext *ctx,
+ 	SPDLOG_TRACE("Handle uretprobe at uprobe_listener_on_leave");
+ 	bpftime::pt_regs regs;
+ 	convert_gum_cpu_context_to_pt_regs(*ctx->cpu_context, regs);
+-	hook_entry->iterate_uretprobe_callbacks(regs);
++	// A uretprobe may need to change the return count after filtering a
++	// userspace packet burst. Keep the callback scoped to this invocation;
++	// nested intercepted calls must restore the outer callback afterward.
++	auto previous = std::move(curr_thread_override_return_callback);
++	curr_thread_override_return_callback =
++		[ctx](uint64_t, uint64_t value) {
++			gum_invocation_context_replace_return_value(
++				ctx, reinterpret_cast<gpointer>(value));
++		};
++	try {
++		hook_entry->iterate_uretprobe_callbacks(regs);
++	} catch (const std::exception &ex) {
++		SPDLOG_ERROR("uretprobe callback failed: {}", ex.what());
++	} catch (...) {
++		SPDLOG_ERROR("uretprobe callback failed");
++	}
++	curr_thread_override_return_callback = std::move(previous);
+ }
+diff --git a/attach/frida_uprobe_attach_impl/test/test_uprobe_uretprobe.cpp b/attach/frida_uprobe_attach_impl/test/test_uprobe_uretprobe.cpp
+index 6af77cd..643bb66 100644
+--- a/attach/frida_uprobe_attach_impl/test/test_uprobe_uretprobe.cpp
++++ b/attach/frida_uprobe_attach_impl/test/test_uprobe_uretprobe.cpp
+@@ -13,6 +13,7 @@
+ 
+ using namespace bpftime;
+ using namespace bpftime::attach;
++extern "C" uint64_t bpftime_set_retval(uint64_t value);
+ 
+ 
+ extern "C" __attribute__((__noinline__))  uint64_t __test_simple_add(uint64_t a,
+@@ -135,6 +136,27 @@ TEST_CASE("Test uretprobe and reverting")
+ 	REQUIRE(invoke_times == 0);
+ }
+ 
++TEST_CASE("Uretprobe can replace the observed function return")
++{
++	frida_attach_impl man;
++	auto func_addr = find_function_addr_by_name("__test_simple_add");
++	REQUIRE(func_addr != nullptr);
++	auto invoke = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(func_addr);
++	uint64_t observed = 0;
++	uint64_t set_result = UINT64_MAX;
++	int id = man.create_uretprobe_at(func_addr, [&](const pt_regs &regs) {
++		observed = PT_REGS_RC(&regs);
++		set_result = bpftime_set_retval(17);
++	});
++	REQUIRE(id >= 0);
++	uint64_t actual = invoke(2, 3);
++	REQUIRE(observed == 7);
++	REQUIRE(set_result == 0);
++	REQUIRE(actual == 17);
++	REQUIRE(man.detach_by_id(id) == 0);
++	REQUIRE(invoke(2, 3) == 7);
++}
++
+ TEST_CASE("Test the mix usage of uprobe and uretprobe")
+ {
+ 	using namespace Catch::Generators;
+diff --git a/runtime/agent/agent.cpp b/runtime/agent/agent.cpp
+index 21e0cb2..f75531a 100644
+--- a/runtime/agent/agent.cpp
++++ b/runtime/agent/agent.cpp
+@@ -1,6 +1,7 @@
+ #include "attach_private_data.hpp"
+ #include "bpf_attach_ctx.hpp"
+ #include "bpftime_shm_internal.hpp"
++#include "bpftime_ufunc.hpp"
+ #if BPFTIME_HAVE_FRIDA_ATTACH
+ #include "frida_attach_private_data.hpp"
+ #include "frida_uprobe_attach_impl.hpp"
+@@ -1059,6 +1060,28 @@ extern "C" void bpftime_agent_main(const gchar *data, gboolean *stay_resident)
+ 			syscall_trace_impl_ptr->set_to_global();
+ #endif
+ 			SPDLOG_INFO("Initializing agent..");
++			// eSAC: register the Hyperscan L7 matcher (esac_hs_scan) ufunc BEFORE attach. Its
++			// provider .so (esac_*_ufunc.so) is LD_PRELOAD'd, so the symbol is globally
++			// resolvable at agent-init (unlike the tenant's own rte_pktmbuf_free_bulk). Only
++			// attempt when the provider is present (L7 tenants); if present but unresolvable,
++			// SAFE-STOP the agent (init_fail) rather than silently running with L7 disabled.
++			if (dlsym(RTLD_DEFAULT, "esac_hs_scan")) {
++				ebpf_ufunc_func_info hs = {};
++				std::strncpy(hs.name, "esac_hs_scan", sizeof(hs.name) - 1);
++				hs.num_args = 2;
++				hs.arg_types[0] = UFUNC_TYPE_POINTER;
++				hs.arg_types[1] = UFUNC_TYPE_UINT32;
++				hs.ret_type = UFUNC_TYPE_UINT64;
++				if (bpftime_ufunc_resolve_from_info(
++					    hs, [](const char *name) {
++						return dlsym(RTLD_DEFAULT, name);
++					    }) != 0) {
++					SPDLOG_ERROR("eSAC hyperscan ufunc unavailable");
++					init_fail();
++					return;
++				}
++				SPDLOG_INFO("eSAC: registered esac_hs_scan ufunc (pre-attach)");
++			}
+ 
+ 			try {
+ 				int res = ctx_holder.ctx
+@@ -1077,6 +1100,36 @@ extern "C" void bpftime_agent_main(const gchar *data, gboolean *stay_resident)
+ 				init_fail();
+ 				return;
+ 			}
++			// eSAC: register the tenant's DPDK bulk-free AFTER attach. At agent-init the
++			// tenant's statically-linked rte_pktmbuf_free_bulk is not yet globally
++			// resolvable via dlsym(RTLD_DEFAULT); by post-attach it is. A short retry
++			// covers late symbol settling. Non-fatal: if still unresolved the comm gate
++			// safely fail-closes (ACT_KILL), preserving the prior behaviour.
++			{
++				void *fb = nullptr;
++				for (int attempt = 0; attempt < 50 && !fb; attempt++) {
++					fb = dlsym(RTLD_DEFAULT, "rte_pktmbuf_free_bulk");
++					if (!fb) usleep(1000);
++				}
++				if (fb) {
++					ebpf_ufunc_func_info free_bulk = {};
++					std::strncpy(free_bulk.name, "rte_pktmbuf_free_bulk",
++						    sizeof(free_bulk.name) - 1);
++					free_bulk.num_args = 2;
++					free_bulk.arg_types[0] = UFUNC_TYPE_POINTER;
++					free_bulk.arg_types[1] = UFUNC_TYPE_UINT32;
++					free_bulk.ret_type = UFUNC_TYPE_VOID;
++					if (bpftime_ufunc_resolve_from_info(
++						    free_bulk, [](const char *name) {
++							return dlsym(RTLD_DEFAULT, name);
++						    }) != 0)
++						SPDLOG_WARN("eSAC: rte_pktmbuf_free_bulk resolve failed post-attach; L7 drop -> fail-close");
++					else
++						SPDLOG_INFO("eSAC: registered rte_pktmbuf_free_bulk ufunc (post-attach)");
++				} else {
++					SPDLOG_WARN("eSAC: rte_pktmbuf_free_bulk unresolvable post-attach; L7 drop -> fail-close");
++				}
++			}
+ 			srand(std::random_device()());
+ 
+ 			int auto_refresh_ms = parse_auto_refresh_ms(data);
+diff --git a/runtime/src/bpf_helper.cpp b/runtime/src/bpf_helper.cpp
+index f628f75..59da0c7 100644
+--- a/runtime/src/bpf_helper.cpp
++++ b/runtime/src/bpf_helper.cpp
+@@ -95,23 +95,108 @@ long bpftime_strncmp(const char *s1, uint64_t s1_sz, const char *s2)
+ }
+ 
+ #ifdef ENABLE_PROBE_READ_CHECK
++#include <csignal>
++#include <csetjmp>
++#if __linux__
++/* Signal-handler based fast-path for probe_read_memory() on Linux.
++ *
++ * bpf_probe_read_user() reads arbitrary runtime-computed userspace
++ * pointers whose validity nothing can prove statically -- the same reason
++ * real kernel eBPF implements this helper as a fault-safe copy_from_user()
++ * rather than a raw pointer dereference. The original implementation here
++ * used a real process_vm_readv() syscall for that safety, which costs a
++ * full user->kernel->user round trip on every call -- unnecessary when (as
++ * in bpftime's actual use case: an in-process agent) the target address is
++ * in the SAME process's own memory, reachable by direct access.
++ *
++ * This replaces that syscall with the same fault-safety guarantee via
++ * sigsetjmp/siglongjmp: install a SIGSEGV/SIGBUS handler once; on the
++ * (overwhelmingly common) case where the pointer is valid, this costs a
++ * sigsetjmp + memcpy, no syscall at all. On a genuine bad pointer, the
++ * hardware fault is caught and returned as -EFAULT, same external
++ * behavior as before, much cheaper in the common case.
++ *
++ * Thread safety: the recovery point and "read in progress" flag are
++ * thread_local, since Linux delivers a synchronous fault (from a bad
++ * memory access instruction) to the exact thread that caused it -- correct
++ * even with multiple concurrently-running threads (e.g. DPDK lcore
++ * workers) each doing their own probe reads.
++ *
++ * A genuine, unrelated SIGSEGV/SIGBUS elsewhere in the process (not from
++ * an active probe_read_memory call) is NOT swallowed: this handler chains
++ * to whatever handler/default action was previously installed for that
++ * signal, exactly as if this code weren't here.
++ */
++static thread_local sigjmp_buf probe_read_jmpbuf;
++static thread_local volatile sig_atomic_t probe_read_active = 0;
++static struct sigaction probe_read_old_segv;
++static struct sigaction probe_read_old_bus;
++
++static void probe_read_fault_handler(int sig, siginfo_t *info, void *ucontext)
++{
++        if (probe_read_active) {
++                siglongjmp(probe_read_jmpbuf, 1);
++        }
++        struct sigaction *old =
++                (sig == SIGBUS) ? &probe_read_old_bus : &probe_read_old_segv;
++        if ((old->sa_flags & SA_SIGINFO) && old->sa_sigaction) {
++                old->sa_sigaction(sig, info, ucontext);
++                return;
++        }
++        if (old->sa_handler && old->sa_handler != SIG_DFL &&
++            old->sa_handler != SIG_IGN) {
++                old->sa_handler(sig);
++                return;
++        }
++        signal(sig, SIG_DFL);
++}
++
++static void probe_read_install_handlers_once()
++{
++        static const bool installed = [] {
++                struct sigaction act = {};
++                act.sa_sigaction = probe_read_fault_handler;
++                act.sa_flags = SA_SIGINFO;
++                sigemptyset(&act.sa_mask);
++                sigaction(SIGSEGV, &act, &probe_read_old_segv);
++                sigaction(SIGBUS, &act, &probe_read_old_bus);
++                return true;
++        }();
++        (void)installed;
++}
++#endif
+ static bool probe_read_memory(void *dst, const void *src, size_t size)
+ {
+-	if (size == 0)
+-		return true;
++        if (size == 0)
++                return true;
+ #if __APPLE__
+-	mach_vm_size_t copied = 0;
+-	return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)src,
+-				      (mach_vm_size_t)size,
+-				      (mach_vm_address_t)dst,
+-				      &copied) == KERN_SUCCESS &&
+-	       copied == size;
++        mach_vm_size_t copied = 0;
++        return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)src,
++                                      (mach_vm_size_t)size,
++                                      (mach_vm_address_t)dst,
++                                      &copied) == KERN_SUCCESS &&
++               copied == size;
+ #elif __linux__
+-	struct iovec local = { dst, size };
+-	struct iovec remote = { const_cast<void *>(src), size };
+-	return syscall(SYS_process_vm_readv,
+-		       probe_access_atfork_status == 0 ? probe_access_pid : getpid(),
+-		       &local, 1, &remote, 1, 0) == (ssize_t)size;
++        probe_read_install_handlers_once();
++        probe_read_active = 1;
++        /* savesigs=0 (plain setjmp-equivalent): skips saving/restoring the
++         * signal mask via sigprocmask, which sigsetjmp(...,1) does on every
++         * single call. This is the hot path (called twice per packet) and a
++         * genuine fault here should never happen for valid packet pointers,
++         * so we don't pay mask save/restore cost for the common case. If a
++         * real fault does occur, SIGSEGV/SIGBUS may remain blocked after
++         * recovery (kernel auto-blocks the signal for the handler's duration
++         * and only auto-unblocks via a normal sigreturn, which siglongjmp
++         * bypasses) -- acceptable here since a genuine fault indicates a bug
++         * elsewhere and the process is not relied on to keep handling faults
++         * indefinitely afterward. */
++        if (sigsetjmp(probe_read_jmpbuf, 0) != 0) {
++                probe_read_active = 0;
++                return false;
++        }
++        memcpy(dst, src, size);
++        probe_read_active = 0;
++        return true;
+ #else
+ #error "Probe memory checks are unsupported on this platform"
+ #endif
+diff --git a/runtime/src/bpf_map/shared/array_map_kernel_user.cpp b/runtime/src/bpf_map/shared/array_map_kernel_user.cpp
+index 5857280..8d0d42a 100644
+--- a/runtime/src/bpf_map/shared/array_map_kernel_user.cpp
++++ b/runtime/src/bpf_map/shared/array_map_kernel_user.cpp
+@@ -6,10 +6,14 @@
+ #include "spdlog/spdlog.h"
+ #include <bpf_map/shared/array_map_kernel_user.hpp>
+ #include <cerrno>
++#include <cstdlib>
+ #if __linux__
+ #include <bpf/libbpf.h>
+ #include <bpf/bpf.h>
+ #include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <string.h>
+ #include <unistd.h>
+ #endif
+ 
+@@ -35,15 +39,52 @@ static size_t bpf_map_mmap_sz(unsigned int value_sz, unsigned int max_entries)
+ }
+ 
+ 
++
++// eSAC: receive a kernel-map fd from the privileged root loader's fd-broker over SCM_RIGHTS.
++// Lets a NON-root agent (no CAP_BPF) obtain the fd without calling bpf_map_get_fd_by_id.
++static int kpolicy_recv_fd_from_broker(const char *sockpath, int kernel_map_id)
++{
++	int s = socket(AF_UNIX, SOCK_STREAM, 0);
++	if (s < 0) return -1;
++	struct sockaddr_un sa; memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX;
++	strncpy(sa.sun_path, sockpath, sizeof sa.sun_path - 1);
++	if (connect(s, (struct sockaddr *)&sa, sizeof sa) < 0) { close(s); return -1; }
++	uint32_t id = (uint32_t)kernel_map_id;
++	if (write(s, &id, sizeof id) != (ssize_t)sizeof id) { close(s); return -1; }
++	char dummy; char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
++	struct iovec iov; iov.iov_base = &dummy; iov.iov_len = 1;
++	struct msghdr msg; memset(&msg, 0, sizeof msg);
++	msg.msg_iov = &iov; msg.msg_iovlen = 1; msg.msg_control = cbuf; msg.msg_controllen = sizeof cbuf;
++	int fd = -1;
++	if (recvmsg(s, &msg, 0) > 0) {
++		for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
++			if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
++				memcpy(&fd, CMSG_DATA(c), sizeof(int)); break;
++			}
++	}
++	close(s);
++	return fd;
++}
++
+ bool array_map_kernel_user_impl::init_map_fd()
+ {
+ 	if (!has_kernel_map) {
+ 		return false;
+ 	}
++	if (mmap_ptr != nullptr) {
++		return true; // eSAC FD-removal: already mapped, never re-acquire fd
++	}
+ 	if (map_fd >= 0) {
+ 		return true;
+ 	}
+-	map_fd = bpf_map_get_fd_by_id(kernel_map_id);
++	const char *broker = getenv("BPFTIME_FD_BROKER_SOCK");
++	if (broker) {
++		map_fd = kpolicy_recv_fd_from_broker(broker, kernel_map_id);
++		if (map_fd >= 0)
++			SPDLOG_DEBUG("got kernel map fd {} from broker for id {}", map_fd, kernel_map_id);
++	}
++	if (map_fd < 0)
++		map_fd = bpf_map_get_fd_by_id(kernel_map_id);
+ 	if (map_fd < 0) {
+ 		SPDLOG_ERROR("Failed to get fd for kernel map id {}",
+ 			      kernel_map_id);
+@@ -82,8 +123,8 @@ bool array_map_kernel_user_impl::init_map_fd()
+ 	}
+ 	// What does this piece of code do?
+ 	int prot;
+-	if (info.map_flags & BPF_F_RDONLY_PROG)
+-		prot = PROT_READ;
++	if ((info.map_flags & BPF_F_RDONLY_PROG) || getenv("BPFTIME_KERNEL_MAP_RO"))
++		prot = PROT_READ; // eSAC: force RO so a non-RDONLY_PROG (seqlock-writable by root) policy map is still RO in the tenant
+ 	else
+ 		prot = PROT_READ | PROT_WRITE;
+ 	void *mmaped = mmap(mmap_ptr, mmap_sz, prot, MAP_SHARED | MAP_FIXED,
+@@ -97,6 +138,12 @@ bool array_map_kernel_user_impl::init_map_fd()
+ 		return true;
+ 	}
+ 	mmap_ptr = mmaped;
++	if (getenv("BPFTIME_KERNEL_MAP_DROP_FD")) {
++		// eSAC FD-removal: drop the writable kernel-map fd so no in-process
++		// writable handle to the policy map persists in the tenant address space.
++		close(map_fd);
++		map_fd = -1;
++	}
+ 	return true;
+ }
+ 
+diff --git a/runtime/src/bpf_map/userspace/per_cpu_hash_map.hpp b/runtime/src/bpf_map/userspace/per_cpu_hash_map.hpp
+index 420ac51..8cb6433 100644
+--- a/runtime/src/bpf_map/userspace/per_cpu_hash_map.hpp
++++ b/runtime/src/bpf_map/userspace/per_cpu_hash_map.hpp
+@@ -49,7 +49,7 @@ class per_cpu_hash_map_impl {
+ 	bytes_vec_vec key_templates, single_value_templates;
+ 
+     public:
+-	const static bool should_lock = false;
++	const static bool should_lock = true;
+ 
+ 	per_cpu_hash_map_impl(boost::interprocess::managed_shared_memory &memory,
+ 			      uint32_t key_size, uint32_t value_size,
+diff --git a/runtime/syscall-server/syscall_context.cpp b/runtime/syscall-server/syscall_context.cpp
+index efc67a1..0991b19 100644
+--- a/runtime/syscall-server/syscall_context.cpp
++++ b/runtime/syscall-server/syscall_context.cpp
+@@ -138,9 +138,11 @@ bool write_all_to_fd(int fd, const std::string &buf)
+ int get_bpf_obj_info_by_fd(int fd, void *info, uint32_t *info_len,
+ 			   long (*syscall_fn)(long, ...))
+ {
+-#ifdef BPFTIME_BUILD_WITH_LIBBPF
+-	return bpf_obj_get_info_by_fd(fd, info, info_len);
+-#elif defined(__linux__)
++#if defined(__linux__)
++	/* eSAC: ALWAYS use the raw (unhooked) syscall_fn. The libbpf wrapper
++	 * bpf_obj_get_info_by_fd() issues __NR_bpf, which the syscall-server
++	 * mock intercepts -> it never reaches the kernel and returns a zeroed
++	 * info. syscall_fn is orig_syscall_fn, precisely to bypass that mock. */
+ 	union bpf_attr attr = {};
+ 	attr.info.bpf_fd = fd;
+ 	attr.info.info_len = *info_len;
+@@ -174,6 +176,24 @@ std::string format_verifier_program_dump(const uint64_t *instructions,
+ }
+ } // namespace
+ 
++bool syscall_context::should_kernelize(const char *name)
++{
++	if (!kernel_map_names.empty()) {
++		std::string n = name ? std::string(name) : std::string();
++		size_t start = 0;
++		while (true) {
++			size_t comma = kernel_map_names.find(',', start);
++			std::string tok = kernel_map_names.substr(start,
++				comma == std::string::npos ? std::string::npos : comma - start);
++			if (tok == n) return true;
++			if (comma == std::string::npos) break;
++			start = comma + 1;
++		}
++		return false; // allowlist mode: only named maps
++	}
++	return run_with_kernel; // legacy global behavior
++}
++
+ void syscall_context::load_config_from_env()
+ {
+ 	const char *run_with_kernel_env = getenv("BPFTIME_RUN_WITH_KERNEL");
+@@ -183,6 +203,11 @@ void syscall_context::load_config_from_env()
+ 	} else {
+ 		run_with_kernel = false;
+ 	}
++	const char *kmn = getenv("BPFTIME_KERNEL_MAP_NAMES");
++	if (kmn != nullptr) {
++		kernel_map_names = std::string(kmn);
++		SPDLOG_INFO("eSAC selective kernel-backing for maps: {}", kernel_map_names);
++	}
+ 	const char *not_load_pattern = getenv("BPFTIME_NOT_LOAD_PATTERN");
+ 	if (not_load_pattern != nullptr) {
+ 		SPDLOG_INFO("By pass kernel verifier pattern: {}",
+@@ -390,7 +415,7 @@ int syscall_context::create_kernel_bpf_map(int map_fd, int bpftime_map_type)
+ 		return 0;
+ 	}
+ 
+-	res = bpftime_maps_create(info.id, info.name, attr);
++	res = bpftime_maps_create(map_fd, info.name, attr); /* eSAC: register at the fd libbpf relocates the program to (map_ptr_by_fd), kernel id kept in attr.kernel_bpf_map_id for broker/mmap */
+ 	if (res < 0) {
+ 		SPDLOG_ERROR("Failed to create map for id {}", info.id);
+ 		return -1;
+@@ -491,7 +516,7 @@ long syscall_context::handle_sysbpf(int cmd, union bpf_attr *attr, size_t size)
+ 	char *errmsg;
+ 	switch (cmd) {
+ 	case BPF_MAP_CREATE: {
+-		if (run_with_kernel) {
++		if (should_kernelize(attr->map_name)) {
+ 			uint32_t translated_map_type =
+ 				bpftime_translate_shared_map_type_to_kernel_map_type(
+ 					attr->map_type);
+diff --git a/runtime/syscall-server/syscall_context.hpp b/runtime/syscall-server/syscall_context.hpp
+index 3a59156..709a020 100644
+--- a/runtime/syscall-server/syscall_context.hpp
++++ b/runtime/syscall-server/syscall_context.hpp
+@@ -146,6 +146,10 @@ class syscall_context {
+ 	// some extensions are not supported by the verifier, so we need to
+ 	// by pass the verifier to make it work.
+ 	std::string by_pass_kernel_verifier_pattern;
++	// eSAC: allowlist of map NAMES to kernel-back (comma-sep). If set, ONLY these
++	// maps become kernel-backed (KERNEL_USER_ARRAY); all others stay userspace.
++	std::string kernel_map_names;
++	bool should_kernelize(const char *name);
+ 
+ 	void load_config_from_env();
+ 
+diff --git a/vm/llvm-jit b/vm/llvm-jit
+--- a/vm/llvm-jit
++++ b/vm/llvm-jit
+@@ -1 +1 @@
+-Subproject commit 8fc0ceee6ca814cc2c25dff3f789bf7ea0d9ebc5
++Subproject commit 8fc0ceee6ca814cc2c25dff3f789bf7ea0d9ebc5-dirty
