@@ -15,6 +15,8 @@ resource/agent/fd_broker_multi
 resource/kernel/rs_sentinel_reuse
 resource/kernel/rs_concurrency_test
 resource/manager/chap_res_policy
+integrity/kernel/chap_nicgate
+tests/reqP/nicprobe
 integrity/kernel/integ_sentinel_run
 integrity/kernel/integ_setranges
 integrity/kernel/tamper_child

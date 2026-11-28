@@ -34,6 +34,13 @@ int main(int argc, char **argv)
     for (int i=0;i<3;i++){ struct bpf_program *p=bpf_object__find_program_by_name(o,pn[i]);
         if (p && !bpf_program__attach(p)) fprintf(stderr,"attach warn %s\n", pn[i]); }
 
+    /* Request P: sealed-process registry + NIC gate; every program is required (fail-closed: no READY otherwise) */
+    const char *ng[8] = {"ng_open","ng_ioctl","ng_ioctl32","ng_mmap","ng_write","ng_fork","ng_exec","ng_exit"};
+    int nga = 0;
+    for (int i=0;i<8;i++){ struct bpf_program *p=bpf_object__find_program_by_name(o,ng[i]);
+        if (p && bpf_program__attach(p)) nga++; else fprintf(stderr,"[integ] NICGATE attach FAILED %s\n", ng[i]); }
+    fprintf(stderr,"[integ] NICGATE attached=%d/8\n", nga);
+    if (nga != 8) return 1;
     unsigned char one=1; bpf_map_update_elem(pcg,&cgid,&one,BPF_ANY);     /* protect this cgroup */
     unsigned int n=0;
     for (int i=4;i<argc && n<128;i++){ char *c=strchr(argv[i],':'); if(!c) continue; *c=0;
@@ -46,7 +53,10 @@ int main(int argc, char **argv)
     snprintf(p,sizeof p,"%s/protected_cgroups",pindir); bpf_obj_pin(pcg,p);
     snprintf(p,sizeof p,"%s/protected_ranges",pindir); bpf_obj_pin(rng,p);
     snprintf(p,sizeof p,"%s/integ_ctl",pindir); bpf_obj_pin(ctl,p);
-    fprintf(stderr,"[integ] READY cgid=%lu ranges=%u (mprotect/pkey_mprotect/mmapFIXED/mremap/munmap/madvise+do_madvise/shmat/ptrace/execve(at)/mem_open watched)\n", cgid, n);
+    snprintf(p,sizeof p,"%s/sealed_procs",pindir); if (bpf_obj_pin(bpf_object__find_map_fd_by_name(o,"sealed_procs"),p)) return 1;
+    snprintf(p,sizeof p,"%s/nicgate_cfg",pindir); if (bpf_obj_pin(bpf_object__find_map_fd_by_name(o,"nicgate_cfg"),p)) return 1;
+    snprintf(p,sizeof p,"%s/nicgate_stats",pindir); if (bpf_obj_pin(bpf_object__find_map_fd_by_name(o,"nicgate_stats"),p)) return 1;
+    fprintf(stderr,"[integ] READY cgid=%lu ranges=%u (mprotect/pkey_mprotect/mmapFIXED/mremap/munmap/madvise(+DONTFORK/WIPEONFORK)+do_madvise/shmat/ptrace/execve(at)/mem_open watched; NIC gate open/ioctl/mmap/write + seal fork/exec/exit)\n", cgid, n);
     while (!stop) pause();
     return 0;
 }

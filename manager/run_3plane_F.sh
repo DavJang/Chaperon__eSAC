@@ -87,6 +87,7 @@ L7ALW=""; grep -q '^allow ' "$RULES" && L7ALW="--l7-allowlist"   # allow-listed 
 cp "$MG/fabric/offsets.json" "$W/offsets.json"; chmod 0755 "$W"/*.so "$W/chaperon_loader" 2>/dev/null
 AGENT="$W/agent.so"; SERVER="$W/srv.so"
 MEMJ_LIB=""; [ -n "${MEMJ:-}" ] && { cp $CHAP_ROOT/tests/reqJ/chap_memapi_test.so "$W/memapi.so"; chmod 0755 "$W/memapi.so"; MEMJ_LIB="$W/memapi.so"; }   # Request J TEST-ONLY driver
+[ -n "${NICJ:-}" ] && { cp $CHAP_ROOT/tests/reqP/chap_nicgate_test.so "$W/nicj.so"; chmod 0755 "$W/nicj.so"; MEMJ_LIB="${MEMJ_LIB:+$MEMJ_LIB:}$W/nicj.so"; }   # Request P TEST-ONLY driver
 mkdir -p "$DPDKRUN" 2>/dev/null; chmod 1777 "$DPDKRUN" 2>/dev/null
 
 # Request I: Table tab:apis attach points. Agent pre-check = public API entries (bpftime override);
@@ -117,7 +118,8 @@ SVF=${INTRA_SVF:-}; CVF=${INTRA_CVF:-}; CVFMAC=$(cat /sys/bus/pci/devices/${INTR
 say "fabric SVF=$SVF CVF=$CVF SHM=$SHM RUN_ID=$RUN_ID"
 
 FIFO=$W/cmd; mkfifo "$FIFO"; RP=$O/tpid; :>"$RP"; chmod 666 "$RP"
-AENV="XDG_RUNTIME_DIR=$DPDKRUN BPFTIME_GLOBAL_SHM_NAME=$SHM BPFTIME_LOG_OUTPUT=console SPDLOG_LEVEL=${TSPDLOG:-warn} BPFTIME_KERNEL_MAP_NAMES=comm_policy,resource_usage,resource_policy BPFTIME_KERNEL_MAP_RO=1 BPFTIME_FD_BROKER_SOCK=$SOCK BPFTIME_KERNEL_MAP_DROP_FD=1 ESAC_HS_PATTERNS=$W/hs_rules.txt ESAC_MATCH_ACT=2 CHAP_GATED_LAUNCH=1 $( [ "${FAIL_INJECT:-}" = view_unsealed ] || echo CHAP_IMM_VIEW=1 ) CHAP_L7_REQUIRED=1 CHAP_GO_TIMEOUT_S=90 CHAP_GO_DIR=/var/lib/chap_gate CHAP_LINK_REGISTRY=1 CHAP_TEST_ATK=$( [ "${PROGFN_ATK:-0}" = 1 -o "${DISPATCH_ATK:-0}" = 1 ] && echo 1 || echo 0 ) $( [ "${SEALED_DISPATCH:-1}" = 1 ] && echo CHAP_SEALED_DISPATCH=1 ) $( [ -n "${MEMJ:-}" ] && echo "CHAP_MEMAPI_TEST=1 CHAP_MEMAPI_DIR=$W/tenant_cwd CHAP_MEMAPI_GATE_OFF=$GOFF" ) LD_DEBUG=files LD_PRELOAD=$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}"
+NICJ_IBDEV=$(ls /sys/bus/pci/devices/$SVF/infiniband/ 2>/dev/null | head -1)   # RDMA device of the tenant VF (Request P tests)
+AENV="XDG_RUNTIME_DIR=$DPDKRUN $( [ -n "${NICJ:-}" ] && echo "CHAP_NICJ_TEST=1 CHAP_NICJ_DIR=$W/tenant_cwd CHAP_NICJ_IBDEV=$NICJ_IBDEV" ) BPFTIME_GLOBAL_SHM_NAME=$SHM BPFTIME_LOG_OUTPUT=console SPDLOG_LEVEL=${TSPDLOG:-warn} BPFTIME_KERNEL_MAP_NAMES=comm_policy,resource_usage,resource_policy BPFTIME_KERNEL_MAP_RO=1 BPFTIME_FD_BROKER_SOCK=$SOCK BPFTIME_KERNEL_MAP_DROP_FD=1 ESAC_HS_PATTERNS=$W/hs_rules.txt ESAC_MATCH_ACT=2 CHAP_GATED_LAUNCH=1 $( [ "${FAIL_INJECT:-}" = view_unsealed ] || echo CHAP_IMM_VIEW=1 ) CHAP_L7_REQUIRED=1 CHAP_GO_TIMEOUT_S=90 CHAP_GO_DIR=/var/lib/chap_gate CHAP_LINK_REGISTRY=1 CHAP_TEST_ATK=$( [ "${PROGFN_ATK:-0}" = 1 -o "${DISPATCH_ATK:-0}" = 1 ] && echo 1 || echo 0 ) $( [ "${SEALED_DISPATCH:-1}" = 1 ] && echo CHAP_SEALED_DISPATCH=1 ) $( [ -n "${MEMJ:-}" ] && echo "CHAP_MEMAPI_TEST=1 CHAP_MEMAPI_DIR=$W/tenant_cwd CHAP_MEMAPI_GATE_OFF=$GOFF" ) LD_DEBUG=files LD_PRELOAD=$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}"
 TUSER=$(id -nu "${SUDO_UID:-1003}")
 python3 -I "$MG/chap_e_tools.py" libtrust "$TUSER" "$TESTPMD" "$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}" > "$O/lib_trust.txt" 2>&1; LTR=$?
 LT="$(grep LIBTRUST_RESULT $O/lib_trust.txt)"
@@ -193,7 +195,14 @@ CPE=$(cat $CGDIR/cpuset.cpus.effective 2>/dev/null); HMX=$(cat $CGDIR/hugetlb.2M
 IPID=$!
 for i in $(seq 1 15); do grep -qa "READY" "$O/integ.log" && break; sleep 1; done
 grep -qa "READY" "$O/integ.log" || refuse "integrity_sentinel_attach"; mark integrity_sentinel REQUIRED PASS "cgroup-wide watcher READY"
-tl SENTINELS_READY resource-kernel-sentinel+tamper-sentinel
+# Request P: NIC gate (kernel functions through which the mlx5 PMD acquires/controls the NIC = the uverbs command
+# interface) armed BEFORE the tenant is released: until the Manager registers it as a Sealed Process, any tenant-cgroup
+# access to the operator-selected RDMA devices is denied in-kernel + SIGKILL. Missing hook or config => refuse.
+NGA=$(grep -aoE "NICGATE attached=[0-9]+/[0-9]+" "$O/integ.log" | head -1)
+{ [ "$NGA" = "NICGATE attached=8/8" ] && "$IK/chap_nicgate" cfg "$PIND" on > "$O/nicgate_cfg.txt" 2>&1; } \
+  && mark nic_gate_armed REQUIRED PASS "$NGA (fmod_ret security_file_open/ioctl/ioctl_compat/mmap_file/file_permission + sched fork/exec/exit) ; $(cat $O/nicgate_cfg.txt)" \
+  || { mark nic_gate_armed REQUIRED FAIL "${NGA:-no NICGATE line} ; $(cat $O/nicgate_cfg.txt 2>/dev/null)"; refuse "nic_gate_arm"; }
+tl SENTINELS_READY resource-kernel-sentinel+tamper-sentinel+nic-gate
 
 # broker: authenticated (SO_PEERCRED -> tenant Tgid) + single-serve-per-map (reissue blocked). Socket
 # stays tenant-accessible; authorization is by peer identity, not file perms.
@@ -261,7 +270,8 @@ if [ "${FAIL_INJECT:-}" = "range_drop" ]; then   # drop the registered range tha
   NEXP=$(grep -c . "$O/sealed_ranges_merged.txt")
 fi
 python3 -I "$MG/chap_e_tools.py" rangecheck "$TPID" "$O/sealed_ranges_merged.txt" > "$O/rangecheck.txt" 2>&1; RCOK=$?
-if "$IK/integ_setranges" "$PIND/protected_ranges" "$PIND/integ_ctl" "$O/sealed_ranges_merged.txt" "$CS" "$CE" 1 >> "$O/integ.log" 2>&1; then   # block_exec=1 from here on
+BLOCK_EXEC=${BLOCK_EXEC:-1}   # Request P: legacy exec block kept until the NIC gate is verified on the real NIC
+if "$IK/integ_setranges" "$PIND/protected_ranges" "$PIND/integ_ctl" "$O/sealed_ranges_merged.txt" "$CS" "$CE" "$BLOCK_EXEC" >> "$O/integ.log" 2>&1; then   # block_exec=$BLOCK_EXEC from here on
   NR=$(grep -a 'TOTAL n_ranges' "$O/integ.log"|tail -1|grep -oE "n_ranges=[0-9]+"|grep -oE "[0-9]+"); tl RANGES_REGISTERED n=$NR
   { [ "$RCOK" = 0 ] && [ "${NR:-0}" = "$((NEXP+1))" ]; } && mark integrity_range_register REQUIRED PASS "n_ranges=$NR = $NEXP merged sealed ranges (W^X+ufunc+imm-view+selector+rodata+kernel-map-RO+HS+dispatch+agent/engine code) + hook code seg; $(cat $O/merge.txt); $(tail -1 $O/rangecheck.txt)" \
     || refuse_at_barrier integrity_range_register "n_ranges=$NR expected=$((NEXP+1)); $(tail -1 $O/rangecheck.txt)"
@@ -273,6 +283,12 @@ python3 -I "$MG/chap_e_tools.py" coverage "$TPID" "$O" "$PIND" "$CS" "$CE" "/tmp
 python3 -I "$MG/chap_e_tools.py" maptrust "$TUSER" "$TPID" > "$O/map_trust.txt" 2>&1 \
   && mark prebarrier_mapped_code_trust REQUIRED PASS "$(tail -1 $O/map_trust.txt) (live /proc maps at the barrier)" \
   || refuse_at_barrier prebarrier_mapped_code_trust "$(grep -E 'UNTRUSTED|MAPTRUST_RESULT' $O/map_trust.txt | tr '\n' ' ')"
+# Request P: Sealed Process registration = the LAST step before GO (all protections above verified). Only the Manager
+# (root, root-only bpffs pin) writes; identity = tgid + start time, so a reused PID never inherits the status.
+if "$IK/chap_nicgate" seal "$PIND" "$TPID" > "$O/nicgate_seal.txt" 2>&1 && "$IK/chap_nicgate" dump "$PIND" > "$O/nicgate_seal_dump.txt" 2>&1 \
+   && grep -q "^ENTRY pid=$TPID .*origin=1 " "$O/nicgate_seal_dump.txt"; then
+  tl SEALED_REGISTERED pid=$TPID; mark sealed_process_registered REQUIRED PASS "$(cat $O/nicgate_seal.txt) ; $(grep "^ENTRY pid=$TPID " $O/nicgate_seal_dump.txt) ; $(tail -1 $O/nicgate_seal_dump.txt) ; block_exec=$BLOCK_EXEC"
+else refuse_at_barrier sealed_process_registered "$(cat $O/nicgate_seal.txt $O/nicgate_seal_dump.txt 2>/dev/null | tr '\n' ' ')"; fi
 NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n'); tl GO_WRITE_BEGIN token=$NONCE
 if printf 'GO %s\n' "$NONCE" > $GOD/.go_$TPID && chmod 0644 $GOD/.go_$TPID && mv -f $GOD/.go_$TPID $GOD/go_$TPID && grep -q "GO $NONCE" $GOD/go_$TPID; then
   tl GO_WRITTEN token=$NONCE; say "GO written (root-owned $GOD/go_$TPID token=$NONCE) after independent verification + full range registration"
@@ -585,6 +601,7 @@ else
 fi
 
 [ -n "${MEMJ:-}" ] && . "$MG/reqJ_memrate_block.sh"   # Request J: memory-API rate at the sealed-dispatch boundary
+[ -n "${NICJ:-}" ] && . "$MG/reqP_nicgate_block.sh"   # Request P: Sealed-Process NIC gate (TEST-ONLY driver)
 if [ "${RESAPI:-0}" = "1" ]; then   # Request I: Table tab:apis at runtime (live Manager policy updates)
   . "$MG/reqI_resapi_block.sh"
   [ -n "${RESAPI_BYPASS:-}" ] && { final_verdict; cleanup; echo 0 > /sys/bus/pci/devices/0000:3b:00.1/sriov_numvfs 2>/dev/null; say "3PU_DONE RUN_ID=$RUN_ID logs in $O"; exit 0; }
@@ -610,6 +627,13 @@ fi
 python3 -I "$MG/chap_e_tools.py" timeline "$O/timeline_mgr.txt" "$W/testpmd.log" "$W/testpmd.log" > "$O/timeline.txt" 2>&1; TLR=$?
 [ "$TLR" = 0 ] && mark launch_timeline REQUIRED PASS "$(grep TIMELINE_RESULT $O/timeline.txt)" || mark launch_timeline REQUIRED FAIL "$(grep -E 'TIMELINE_RESULT|STREAM_ORDER' $O/timeline.txt | tr '\n' ' ')"
 echo "quit" >&3 2>/dev/null; exec 3>&- 2>/dev/null; sleep 2
+if [ -n "${NICJ:-}" ]; then   # Request P: the sealed entry disappears with the process (no stale status for a later PID)
+  for w in $(seq 1 20); do kill -0 $TPID 2>/dev/null || break; sleep 0.5; done
+  TA=$(kill -0 $TPID 2>/dev/null && echo YES || echo NO); "$IK/chap_nicgate" dump "$PIND" > "$O/nicgate_after_exit.txt" 2>&1
+  { [ "$TA" = NO ] && ! grep -q "^ENTRY pid=$TPID " "$O/nicgate_after_exit.txt"; } \
+    && mark nicj_exit_clears_entry REQUIRED PASS "tenant $TPID exited -> entry removed ; $(tail -1 $O/nicgate_after_exit.txt)" \
+    || mark nicj_exit_clears_entry REQUIRED FAIL "alive=$TA $(tr '\n' ' ' < $O/nicgate_after_exit.txt)"
+fi
 CREATED=$(grep -ac "Flow rule #[0-9]* created" "$W/testpmd.log"); say "post-exit testpmd created=$CREATED"
 if [ "${RX_TEST:-0}" = "1" ]; then   # judged after quit (fwd stats + pool dumps are buffered stdout)
   python3 -I "$MG/chap_e_tools.py" rxapp "$W/testpmd.log" >> "$O/rx_phases.txt"
