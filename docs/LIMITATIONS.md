@@ -39,12 +39,13 @@ exercised by the functional verification.
   devices are denied to every tenant process; the tenant device is denied to processes outside the tenant cgroup
   (deny only, no kill). A uverbs device added after arming is not in the `open` list; `ioctl`/`mmap`/`write` on it are
   still gated (same `file_operations`, device not selected).
-- **Unresolved: direct NIC programming by code inside a sealed process.** The Agent enforces at the PMD burst functions;
-  application code in the same (sealed) process can create its own queue on the tenant VF through verbs (or write to
-  the PMD's queues) and transmit without passing the Agent. Verified on the reference host: 20 raw frames sent by the
-  sealed tenant through a raw packet QP reached the peer VF (`NICQ=all`, `nicq_sealed_direct_verbs`). The kernel gate
-  cannot separate PMD code from application code of the same process; closing this needs a design change (not done).
-- Kernel network stack and other paths (Request Q): the tenant has no `CAP_NET_ADMIN` (netlink, socket ioctls, ethtool,
+- **Outside the threat model: direct NIC programming by code inside the same tenant process.** The Agent enforces at
+  the PMD burst functions; application code in the same (sealed) process can create its own queue on the tenant VF
+  through verbs (or write to the PMD's queues) and transmit without passing the Agent. Observed on the reference host:
+  20 raw frames sent by the sealed tenant through a raw packet QP reached the peer VF (`NICQ=all`,
+  `nicq_sealed_direct_verbs`, reported as INFO). The kernel gate cannot separate PMD code from application code of the
+  same process; this is not prevented by the current design.
+- Kernel network stack and other paths: the tenant has no `CAP_NET_ADMIN` (netlink, socket ioctls, ethtool,
   tc and RDMA-netlink changes fail with `EPERM`) and runs in a network namespace holding only `lo` and its VF netdev,
   kept DOWN; `AF_PACKET`, raw and UDP sends cannot reach the NIC (verified with a peer-VF observer) and RoCE on the VF is
   DOWN. `iopl`/`ioperm` fail (seccomp) and `/proc/bus/pci` is masked. Event fds derived from a uverbs context have no

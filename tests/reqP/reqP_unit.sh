@@ -8,7 +8,7 @@ B=${B:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}; IK=$B/integrity/ker
 [ -f "$B/manager/chap_env.sh" ] && . "$B/manager/chap_env.sh"; export CHAP_TENANT_USER   # Request Q: dedicated tenant account
 IBDEV=${IBDEV:-rocep59s0f1v0}      # the tenant's (operator-selected) RDMA device
 OIB=${OIB:-rocep59s0f1v1}          # another VF's RDMA device (Request Q)
-R=${R:-/home/sungwoo/chaperon_results/reqP_20261128/unit}; mkdir -p $R; cd $R
+R=${R:-$B/results/reqp_unit_$(date +%Y%m%d_%H%M%S)}; mkdir -p $R; cd $R   # results/ is not tracked
 CG=/sys/fs/cgroup/reqp_unit_$$; mkdir $CG; CGID=$(stat -c %i $CG)
 PIND=/sys/fs/bpf/chap_reqp_unit_$$; mkdir -p $PIND
 RES=$R/UNIT_RESULT.txt; : > $RES

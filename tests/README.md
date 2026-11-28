@@ -3,7 +3,8 @@
 Functional and regression checks run inside the launcher (`manager/run_3plane_F.sh`, modes in
 [../docs/RUN.md](../docs/RUN.md)); each check is judged from the observed value and written to
 `run/CHECKS.tsv` of the run directory. The verification blocks sourced by the launcher are in `manager/`
-(`reqI_*_block.sh`, `reqJ_memrate_block.sh`, `reqI_perf1_block.sh`).
+(`reqI_*_block.sh`, `reqJ_memrate_block.sh`, `reqI_perf1_block.sh`, `reqP_nicgate_block.sh` for `NICJ=…`,
+`reqQ_nicgate_block.sh` for `NICQ=all`).
 
 ## Run chains
 
@@ -26,6 +27,11 @@ chains do this).
 | `gen/esac_l47gen.c` | DPDK generator with exact L4 fields and payloads (functional checks) |
 | `communication/combo/c_filter_hs_gate_excl_TESTFAILRX2.bpf.o` | fail build for `FAIL_INJECT=rx_window_fail` |
 | `integrity/kernel/tamper_child.c` | tamper attempt for `TAMPER=1` |
+| `reqP/chap_nicgate_test.c` | driver thread inside the tenant for the NIC-gate and lifecycle checks (`NICJ=…`, `NICQ=all`); never part of a normal launch |
+| `reqP/nicprobe.c` | RDMA verbs probe (open / ioctl / compat ioctl / mmap / write, fd passing, event fds, fd import) used as an unsealed image |
+| `reqP/cg_probe.py` | a process that only joins the tenant cgroup (never registered) and touches the RDMA device |
+| `reqP/reqP_unit.sh` | kernel-level NIC-gate test on the real RDMA device without DPDK (own cgroup and Sentinel instance; `IBDEV` = tenant device, `OIB` = another VF's device) |
+| `reqQ/netpath_probe.c` | NIC paths outside the verbs interface (AF_PACKET, UDP, raw IP, netdev control, I/O-port and `/proc/bus/pci` permission checks); delivery is judged by a peer-VF observer |
 
 ## Unit tests
 
