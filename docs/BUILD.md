@@ -6,7 +6,7 @@
 |---|---|
 | OS / kernel | Ubuntu 22.04, Linux 6.8 with eBPF, BTF, uprobes, `bpf_send_signal`, cgroup v2 |
 | Compilers | clang 14 (BPF objects), gcc 11.4 / g++ (userspace tools, runtime) |
-| Libraries | libbpf (`libbpf.so.0`, headers 0.5), libelf, libcap, Hyperscan 5.4 (`libhs`) |
+| Libraries | libbpf (`libbpf.so.0`, headers 0.5), libelf, libcap, Hyperscan 5.4 (`libhs`); libbpf ≥ 1.x as a static library + headers (`$LIBBPF1`, reference: libbpf 1.7 from the bpftime build) for the Tamper Sentinel object and loader; rdma-core `libibverbs` (the one the tenant DPDK links) for the Request P test programs |
 | DPDK | 22.11.0 with the mlx5 PMD for the tenant (`dpdk-testpmd` in `PATH`); a DPDK for the traffic generator |
 | bpftime | upstream commit `edcc8ec` + `agent/patches/` (see [../agent/README.md](../agent/README.md)) |
 | Verification tools | `bpftool`, `bpftrace`, `strace`, `python3` |
@@ -39,10 +39,14 @@ BPFTIME_SRC=/path/to/bpftime BPFTIME_BUILD=/path/to/bpftime/build OUT=/path/to/c
 (cd resource/kernel && gcc -O2 -o rs_sentinel_reuse rs_sentinel_reuse.c -lbpf -lelf)
 (cd resource/manager && gcc -O2 -o chap_res_policy chap_res_policy.c -lbpf)
 
-# Integrity: Tamper Sentinel, its loader and range tool, seal helper
-(cd integrity/kernel && clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I. -c integrity_sentinel.bpf.c)
-(cd integrity/kernel && gcc -O2 -o integ_sentinel_run integ_sentinel_run.c -lbpf -lelf)
+# Integrity: Tamper Sentinel (with the Sealed-Process NIC gate), its loader, range tool, NIC-gate tool, seal helper.
+# The Sentinel uses fmod_ret / tp_btf programs and CO-RE: compile it with libbpf >= 1.x headers and link its loader
+# statically against libbpf >= 1.x (libbpf 0.5 cannot parse the Linux 6.8 kernel BTF). LIBBPF1 = directory holding
+# libbpf.a and the bpf/ header directory (reference host: the libbpf 1.7 built inside the bpftime build tree).
+(cd integrity/kernel && clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I. -I$LIBBPF1 -c integrity_sentinel.bpf.c)
+(cd integrity/kernel && gcc -O2 -I$LIBBPF1 -o integ_sentinel_run integ_sentinel_run.c $LIBBPF1/libbpf.a -lelf -lz)
 (cd integrity/kernel && gcc -O2 -o integ_setranges integ_setranges.c -lbpf)
+(cd integrity/kernel && gcc -O2 -o chap_nicgate chap_nicgate.c -lbpf)
 (cd integrity && gcc -shared -fPIC -O2 -Wl,-z,now -Wl,-z,relro -o esac_seal.so esac_seal.c)
 ```
 
@@ -56,6 +60,10 @@ Test components (used only by the verification modes and tests):
 (cd resource/kernel && gcc -O2 -o rs_concurrency_test rs_concurrency_test.c -lbpf -lelf -lpthread \
     && gcc -shared -fPIC -O2 -o libstub_flow.so stub_flow.c)
 (cd tests/gen && gcc -O2 -o esac_l47gen esac_l47gen.c $(pkg-config --cflags --libs libdpdk))  # traffic generator
+# Request P (NIC gate) tests; IBV = prefix of the rdma-core the tenant DPDK links (reference host: /usr/local)
+(cd tests/reqP && gcc -O2 -I$IBV/include -o nicprobe nicprobe.c -L$IBV/lib -Wl,-rpath,$IBV/lib -libverbs)       # NICJ, reqP_unit.sh
+(cd tests/reqP && gcc -O2 -fPIC -shared -I$IBV/include -o chap_nicgate_test.so chap_nicgate_test.c \
+    -L$IBV/lib -Wl,-rpath,$IBV/lib -libverbs -lpthread)                                                    # NICJ=...
 ```
 
 Unit tests: see [../tests/README.md](../tests/README.md).

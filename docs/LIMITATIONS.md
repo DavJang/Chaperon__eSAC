@@ -30,7 +30,34 @@ exercised by the functional verification.
 - Memory API calls cross into the kernel (uprobes at the boundary and in the allocator); per-packet heap allocation
   changes the kernel-crossing profile.
 
+## NIC access gate (Sealed Process)
+
+- Gated paths: the RDMA uverbs command interface of the mlx5 PMD — `open` of the uverbs character devices present when
+  the gate is armed (matched by device number), and `ioctl`, compat `ioctl`, `mmap` and `write` on any file with the
+  uverbs `file_operations` (also an fd opened before joining the cgroup, inherited across `exec`, or received over
+  `SCM_RIGHTS`). A uverbs device added after arming is not in the `open` list; `ioctl`/`mmap`/`write` on it are still
+  gated (same `file_operations`).
+- Not gated, not claimed: control of the VF netdev through the kernel network stack (netlink, socket ioctls, ethtool,
+  tc) with the tenant's `CAP_NET_ADMIN`; `AF_PACKET`/raw sockets with `CAP_NET_RAW` on the VF netdev; RDMA netlink;
+  event file descriptors derived from a uverbs context (async event / completion channel: other `file_operations`,
+  they deliver events and do not submit commands); NIC access paths of other drivers (VFIO, PCI resource files —
+  root-only device files, not used by the mlx5 PMD). Only the mlx5/uverbs path is implemented.
+- `security_file_permission` runs for every `read`/`write` system call on the host; the gate program returns at once for
+  other files. This cost is outside the tenant packet path (the forwarding lcore makes no system calls) and was not
+  measured.
+- A program executed in the tenant cgroup stays in that cgroup: the cgroup limits, the Resource Sentinel's cgroup-slot
+  accounting (calls through its attach points in the same binary are charged to the tenant) and the Tamper Sentinel's
+  cgroup-wide rules (sealed address ranges of the tenant, `/proc/<pid>/mem`, `ptrace`) apply to it. A `munmap`,
+  `mprotect(PROT_WRITE)`, `MAP_FIXED` or `madvise` of the new program that overlaps one of those addresses kills it
+  (not observed; address randomization makes an overlap unlikely).
+- Registration reads the start time from `/proc/<pid>/stat` and re-reads it after the map write (the entry is removed if
+  the process changed); the kernel compares it with the task's start time in clock ticks on every gated call.
+
 ## Not exercised by the functional verification
+
+- NIC gate: compat (32-bit) `ioctl`, `exec` from a non-leader thread, `vfork`/`clone(CLONE_VM)` children, the uverbs
+  `write` command path inside a DPDK tenant (tested with the kernel-level test only), applications other than
+  `dpdk-testpmd` and dperf.
 
 - MPRQ RX burst variants (hooked, not selected in the tested configuration).
 - `rte_mempool_create` denial, Sentinel termination on queue setup, release on `rte_mempool_free`, release of a failed

@@ -35,6 +35,22 @@ Paths are relative to the repository root; `$CHAP_RUNTIME_DIR` is set in `manage
 | Seal helper | `integrity/esac_seal.c` | `integrity/esac_seal.so` | `1068509c` |
 | TEST-ONLY memory-API driver | `tests/reqJ/chap_memapi_test.c` | `tests/reqJ/chap_memapi_test.so` (preloaded only in `MEMJ=…` tests) | `41c315c2` |
 
+### Request P: Sealed-Process NIC gate (branch `feat/reqP-nic-seal-gate`, not on `main` until approved)
+
+Changed or added artifacts; every other component above is unchanged and used as is.
+
+| Component | Source | Artifact | sha256 |
+|---|---|---|---|
+| Tamper Sentinel + NIC gate (replaces `8d42d82e` on this branch) | `integrity/kernel/integrity_sentinel.bpf.c` | `integrity/kernel/integrity_sentinel.bpf.o` | `68cf5857` |
+| Tamper Sentinel loader (replaces `775aa3ea`; static libbpf 1.7) | `integrity/kernel/integ_sentinel_run.c` | `integrity/kernel/integ_sentinel_run` | `81410bfc` |
+| NIC-gate / Sealed-Process registry tool (Manager) | `integrity/kernel/chap_nicgate.c` | `integrity/kernel/chap_nicgate` | `35b4d8ef` |
+| Launcher | `manager/run_3plane_F.sh` (+ `manager/reqP_nicgate_block.sh` for `NICJ=…`) | (scripts) | — |
+| TEST-ONLY NIC driver | `tests/reqP/chap_nicgate_test.c` | `tests/reqP/chap_nicgate_test.so` (preloaded only in `NICJ=…` tests) | `0662676f` |
+| TEST-ONLY RDMA probe | `tests/reqP/nicprobe.c` | `tests/reqP/nicprobe` | `6981178f` |
+
+`integ_setranges` (`46a538fc`), the Agent runtime (`1495de2b`), the Resource Sentinel (`470da08a`) and all other
+components are the frozen ones.
+
 ### Reproducibility notes
 
 - The userspace tools above (loader, broker, Sentinel loaders, policy tools, seal helper, `amblaunch`, test driver)
