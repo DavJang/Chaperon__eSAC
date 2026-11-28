@@ -22,7 +22,7 @@ BPFTIME_SRC=/path/to/bpftime BPFTIME_BUILD=/path/to/bpftime/build OUT=/path/to/c
 
 # Manager: loader and tenant launch helper
 (cd manager && gcc -O2 -o chaperon_loader chaperon_loader.c -Iinclude -lbpf)
-(cd manager/tools && gcc -O2 -o amblaunch amblaunch.c -lcap)
+(cd manager/tools && gcc -O2 -o amblaunch amblaunch.c -lcap)    # tenant launcher (caps, NO_NEW_PRIVS, seccomp)
 
 # Communication: Filter (L4/L7, 64 mask-probe, RX/TX windows), Hyperscan provider, policy writer
 (cd communication && mkdir -p combo && clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I include -I /usr/include \
@@ -63,7 +63,8 @@ Test components (used only by the verification modes and tests):
 # Request P (NIC gate) tests; IBV = prefix of the rdma-core the tenant DPDK links (reference host: /usr/local)
 (cd tests/reqP && gcc -O2 -I$IBV/include -o nicprobe nicprobe.c -L$IBV/lib -Wl,-rpath,$IBV/lib -libverbs)       # NICJ, reqP_unit.sh
 (cd tests/reqP && gcc -O2 -fPIC -shared -I$IBV/include -o chap_nicgate_test.so chap_nicgate_test.c \
-    -L$IBV/lib -Wl,-rpath,$IBV/lib -libverbs -lpthread)                                                    # NICJ=...
+    -L$IBV/lib -Wl,-rpath,$IBV/lib -libverbs -lpthread)                                                    # NICJ=..., NICQ=...
+(cd tests/reqQ && gcc -O2 -o netpath_probe netpath_probe.c)                                            # NICQ=all (permission checks only)
 ```
 
 Unit tests: see [../tests/README.md](../tests/README.md).

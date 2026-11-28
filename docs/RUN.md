@@ -11,11 +11,19 @@ never overwrites another run.
   (idempotent; set `PF1`/`IF1` for your NIC; called by the launcher). The tenant uses the server VF, the
   generator/peer the client VF.
 - Hugepages, `/sys/fs/bpf` mounted, cgroup v2, root via `sudo -n`.
-- Tenant user: `manager/tools/amblaunch` drops to uid/gid 1003 with `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_SYS_RAWIO`
-  as ambient capabilities (needed by the mlx5 PMD); adjust the uid in `amblaunch.c` for your host.
+- Tenant account: a dedicated system account without sudo rights and without administrative groups, e.g.
+  `useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group chaptenant`, named
+  in `manager/chap_env.sh` (`CHAP_TENANT_USER`). The launcher refuses to start otherwise (`tenant_account`).
+  `manager/tools/amblaunch` drops to it with `CAP_NET_RAW` + `CAP_SYS_RAWIO` as ambient capabilities (needed by the mlx5
+  PMD), `PR_SET_NO_NEW_PRIVS` and a seccomp filter that fails `iopl`/`ioperm`; the launcher reads these attributes
+  back from `/proc` at the barrier (`tenant_privileges`).
+- Tenant network namespace (default, `TNETNS=1`): the launcher creates a namespace holding only `lo` and the tenant VF
+  netdev (kept DOWN) and starts the tenant through `manager/tools/tenant_ns_exec.sh`, which also masks `/proc/bus/pci`
+  in the tenant mount namespace (`tenant_netns`). The PF, the representors and the host interfaces are not visible to
+  the tenant.
 - Build all components ([BUILD.md](BUILD.md)) and create `manager/chap_env.sh` from `manager/chap_env.example.sh`
-  (`CHAP_RUNTIME_DIR`, `CHAP_DPDK_RUNDIR`, `CHAP_DPDK_LIBDIR`). `sudo` drops the caller's environment; the launcher
-  reads these values from the file.
+  (`CHAP_RUNTIME_DIR`, `CHAP_DPDK_RUNDIR`, `CHAP_DPDK_LIBDIR`, `CHAP_TENANT_USER`). `sudo` drops the caller's
+  environment; the launcher reads these values from the file.
 - The launcher contains fixed offsets for the reference `dpdk-testpmd` build (`FC_OFF`, `CC_OFF`, `DC_OFF`);
   the Table API attach points are resolved by symbol (`manager/chap_res_offsets.py`). Another testpmd build needs
   new fixed offsets.
@@ -43,19 +51,23 @@ kernel functions through which the mlx5 PMD acquires and controls the NIC, i.e. 
 `security_file_open` (uverbs character devices, matched by device number), `security_file_ioctl` /
 `security_file_ioctl_compat`, `security_mmap_file` and `security_file_permission` (write) on files whose
 `file_operations` are `uverbs_fops` / `uverbs_mmap_fops` (fmod_ret programs: the call fails with `-EPERM` before the
-uverbs handler runs). A process without a valid Sealed-Process entry is denied and SIGKILLed.
+uverbs handler runs). A process without a valid Sealed-Process entry is denied and SIGKILLed. The decision also
+depends on the device of the uverbs file (Request Q): only the operator-selected RDMA device of the tenant may be
+used, and only by sealed tenant processes; a tenant process (sealed or not) touching another uverbs device is denied
+and SIGKILLed; the tenant device used by a process outside the tenant cgroup (e.g. through a passed fd) is denied.
 
 - Registry `sealed_procs` (pinned in the root-only bpffs directory): key tgid, identity tgid + start time (clock
   ticks, `/proc/<pid>/stat` field 22). Only the Manager writes it (`chap_nicgate seal`), as the last step before GO.
 - `fork`/`clone` of a new process (not a thread) of a sealed process: the child is registered (`origin=2`). A thread
   uses the entry of its thread group.
 - Successful `exec`: the entry is removed (a new program starts without the Agent). A failed exec keeps it.
-- Exit of the thread-group leader removes the entry; an entry whose start time differs from the current process
-  (reused PID) is deleted and the access denied.
+- Exit of the last thread of the process removes the entry (a leader that exits first leaves it while other threads
+  live); an entry whose start time differs from the current process (reused PID) is deleted and the access denied.
 - `madvise(MADV_DONTFORK|MADV_WIPEONFORK)` on a protected range is a Tamper Sentinel violation, so a sealed child
   always inherits the sealed regions.
-- `chap_nicgate cfg <pindir> on` takes the uverbs `file_operations` addresses from `/proc/kallsyms` and every uverbs
-  device present at that time; the launcher refuses if not all 8 gate programs attached or the configuration fails.
+- `chap_nicgate cfg <pindir> on <ibdev>` takes the uverbs `file_operations` addresses from `/proc/kallsyms`, every
+  uverbs device present at that time, and the selected RDMA device of the tenant VF (required); the launcher refuses
+  if not all 8 gate programs attached or the configuration fails.
 - `chap_nicgate dump <pindir>` prints the entries and the allow/deny counters.
 
 ## Modes (environment variables)
@@ -75,6 +87,8 @@ uverbs handler runs). A process without a valid Sealed-Process entry is denied a
 | `BLOCK_EXEC=1` | legacy exec block: any `execve` in the tenant cgroup is killed (default `0`: exec allowed, the new program is unsealed and the NIC gate stops its NIC access) |
 | `NICJ=all` | Request P checks with the TEST-ONLY driver `tests/reqP/chap_nicgate_test.so`: sealed allow (launch, thread, fork child + protected regions), failed exec, exec of normal programs, exec of an unsealed `dpdk-testpmd`, inherited / SCM_RIGHTS uverbs fds, same-cgroup unregistered process, forged registration, PID reuse, worker syscalls during traffic, entry removed at exit (with `BLOCK_EXEC=1` the exec cases are replaced by the legacy-block check) |
 | `NICJ=madv NICJ_MADV=10\|18` | destructive: the sealed tenant calls `madvise(MADV_DONTFORK\|MADV_WIPEONFORK)` on a protected range and must be killed |
+| `NICQ=all` | Request Q checks: no privilege gain (fork child, `sudo`, file-capability `ping`), NIC paths outside uverbs from the sealed process and from exec'd images with a peer-VF observer (AF_PACKET, UDP, raw IP, netdev/tc/RDMA control, `iopl`/`ioperm`, `/proc/bus/pci`), derived event fds, another VF's RDMA device, a tenant fd used outside the cgroup, vfork, CLONE_VM, non-leader exec, leader exit first, EACCES exec, compat ioctl, concurrency + PID reuse; INFO: direct verbs transmission by sealed tenant code |
+| `TNETNS=0` | TEST-ONLY: no tenant network namespace (the kernel-stack paths of the VF netdev are then open) |
 | `tests/reqP/reqP_unit.sh` | kernel-level gate test on the real RDMA device without DPDK (own test cgroup and Sentinel instance) |
 | `run_3plane_F_hl.sh HARD=3` | NIC command-submission boundary probe (generated by `make_F_hl.py`) |
 

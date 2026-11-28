@@ -51,6 +51,25 @@ Changed or added artifacts; every other component above is unchanged and used as
 `integ_setranges` (`46a538fc`), the Agent runtime (`1495de2b`), the Resource Sentinel (`470da08a`) and all other
 components are the frozen ones.
 
+### Request Q: security hardening of Request P (branch `feat/reqQ-security-hardening`, not on `main` until approved)
+
+Changed or added artifacts relative to the Request P table above; everything else is unchanged.
+
+| Component | Source | Artifact | sha256 |
+|---|---|---|---|
+| Tamper Sentinel + NIC gate (per-device rule, last-thread exit) | `integrity/kernel/integrity_sentinel.bpf.c` | `integrity/kernel/integrity_sentinel.bpf.o` | `6b50e6f3` |
+| Tamper Sentinel loader (unchanged since Request P) | `integrity/kernel/integ_sentinel_run.c` | `integrity/kernel/integ_sentinel_run` | `81410bfc` |
+| NIC-gate / registry tool (selected device) | `integrity/kernel/chap_nicgate.c` | `integrity/kernel/chap_nicgate` | `63b6fe22` |
+| Tenant launch helper (dedicated account, CAP_NET_RAW+CAP_SYS_RAWIO, NO_NEW_PRIVS, iopl/ioperm seccomp) | `manager/tools/amblaunch.c` | `manager/tools/amblaunch` | `b83b2643` |
+| Tenant namespace wrapper (netns + /proc/bus/pci mask) | `manager/tools/tenant_ns_exec.sh` | (script) | `255bb691` |
+| Launcher | `manager/run_3plane_F.sh` (+ `reqP_nicgate_block.sh`, `reqQ_nicgate_block.sh`) | (scripts) | — |
+| TEST-ONLY tenant driver | `tests/reqP/chap_nicgate_test.c` | `tests/reqP/chap_nicgate_test.so` | `df45d446` |
+| TEST-ONLY RDMA probe | `tests/reqP/nicprobe.c` | `tests/reqP/nicprobe` | `d40f9a8d` |
+| TEST-ONLY network-path probe (permission checks only) | `tests/reqQ/netpath_probe.c` | `tests/reqQ/netpath_probe` | `452788bf` |
+
+Host requirement: a dedicated tenant account (`CHAP_TENANT_USER` in `manager/chap_env.sh`, no sudo rights, no
+administrative group); see [docs/RUN.md](docs/RUN.md).
+
 ### Reproducibility notes
 
 - The userspace tools above (loader, broker, Sentinel loaders, policy tools, seal helper, `amblaunch`, test driver)

@@ -14,7 +14,7 @@ NJ=$O/nicj.txt; : > $NJ; WT=$O/nicj_uverbs_trace.txt
 say "===== Request P NICJ=$NICJ BLOCK_EXEC=$BLOCK_EXEC: Sealed-Process NIC gate (ibdev=$NICJ_IBDEV $UVD) ====="
 ngd(){ "$IK/chap_nicgate" dump "$PIND"; }
 ngs(){ ngd | tail -1 | sed -E 's/allow\{/allow_/; s/\} deny\{/ deny_/; s/\}//' | awk '{p="";for(i=1;i<=NF;i++){t=$i; if(t ~ /^allow_/){p="allow_";sub(/^allow_/,"",t)} else if(t ~ /^deny_/){p="deny_";sub(/^deny_/,"",t)} else if(t ~ /^(entries|fork_inherit)/) p=""; printf "%s%s ", p, t} print ""}'; }
-nv(){ echo "$1" | grep -oE "(^| )$2=[0-9]+" | head -1 | sed 's/.*=//'; }
+nv(){ local v; v=$(echo "$1" | grep -oE "(^| )$2=[0-9]+" | head -1 | sed 's/.*=//'); echo ${v:-0}; }
 dl(){ echo $(( $(nv "$2" $3) - $(nv "$1" $3) )); }                       # dl S0 S1 key
 dsum(){ local s=0 k; for k in open ioctl ioctl32 mmap write; do s=$((s + $(dl "$1" "$2" deny_$k))); done; echo $s; }
 asum(){ local s=0 k; for k in open ioctl ioctl32 mmap write; do s=$((s + $(dl "$1" "$2" allow_$k))); done; echo $s; }
@@ -139,16 +139,25 @@ else
     || mark nicj_scm_rights_fd_blocked REQUIRED FAIL "$(tail -1 $NJ)"
 fi
 
-# N9 a process that merely joins the tenant cgroup (never registered) - open, and an fd opened before joining
+# N9 a process that merely joins the tenant cgroup (never registered) - open, and an fd opened before joining.
+# Request Q: a file of the tenant's (selected) device can no longer be opened outside the tenant cgroup (N9c), so the
+# fd brought in from outside is one of ANOTHER VF's device; inside the cgroup it is denied as a foreign device + SIGKILL.
+OIBP=$(ls /sys/bus/pci/devices/$CVF/infiniband/ 2>/dev/null | head -1); OUVD=/dev/infiniband/$(ls /sys/class/infiniband/$OIBP/device/infiniband_verbs/ 2>/dev/null | grep -m1 uverbs)
 for MD in open preopen_ioctl preopen_mmap; do
-  K=$(case $MD in open) echo open;; preopen_ioctl) echo ioctl;; *) echo mmap;; esac)
-  S0=$(ngs); python3 -I "$CGP" "$CGDIR/cgroup.procs" "$TUID" "$UVD" $MD > $O/nicj_cgp_$MD.txt 2>&1; RC=$?; S1=$(ngs)
+  K=$(case $MD in open) echo open;; preopen_ioctl) echo ioctl;; *) echo mmap;; esac); DEV=$UVD; CK=deny_$K
+  [ "$MD" != open ] && { DEV=$OUVD; CK=foreign_dev; }
+  S0=$(ngs); python3 -I "$CGP" "$CGDIR/cgroup.procs" "$TUID" "$DEV" $MD > $O/nicj_cgp_$MD.txt 2>&1; RC=$?; S1=$(ngs)
   PP=$(grep -oE "joined pid=[0-9]+" $O/nicj_cgp_$MD.txt | cut -d= -f2)
-  rec "N9 $MD rc=$RC $(tr '\n' ' ' < $O/nicj_cgp_$MD.txt | cut -c1-300) handlers=$(hall $PP) deny_$K+$(dl "$S0" "$S1" deny_$K)"
-  { [ "$RC" = 137 ] && grep -q "CGP $K begin" $O/nicj_cgp_$MD.txt && ! grep -q "CGP $K ret" $O/nicj_cgp_$MD.txt && [ "$(hall $PP)" = 0 ] && [ "$(dl "$S0" "$S1" deny_$K)" -ge 1 ]; } \
-    && mark nicj_samecg_unregistered_${MD}_blocked REQUIRED PASS "pid $PP (tenant uid, joined the tenant cgroup, not registered): $K -> deny+SIGKILL rc=137, handler calls=0" \
+  rec "N9 $MD dev=$DEV rc=$RC $(tr '\n' ' ' < $O/nicj_cgp_$MD.txt | cut -c1-300) handlers=$(hall $PP) $CK+$(dl "$S0" "$S1" $CK)"
+  { [ "$RC" = 137 ] && grep -q "CGP $K begin" $O/nicj_cgp_$MD.txt && ! grep -q "CGP $K ret" $O/nicj_cgp_$MD.txt && [ "$(hall $PP)" = 0 ] && [ "$(dl "$S0" "$S1" $CK)" -ge 1 ]; } \
+    && mark nicj_samecg_unregistered_${MD}_blocked REQUIRED PASS "pid $PP (tenant uid, joined the tenant cgroup, not registered): $K on $DEV -> deny+SIGKILL rc=137, handler calls=0 ($CK+$(dl "$S0" "$S1" $CK))" \
     || mark nicj_samecg_unregistered_${MD}_blocked REQUIRED FAIL "$(tail -1 $NJ)"
 done
+S0=$(ngs); python3 -I "$CGP" "$CGDIR/cgroup.procs" "$TUID" "$UVD" preopen_ioctl > $O/nicj_cgp_outside_tenantdev.txt 2>&1; RC=$?; S1=$(ngs)
+rec "N9c outside open of the tenant device rc=$RC $(tr '\n' ' ' < $O/nicj_cgp_outside_tenantdev.txt | cut -c1-300) outside_use+$(dl "$S0" "$S1" outside_use)"
+{ [ "$RC" = 1 ] && grep -q "PermissionError.*Operation not permitted" $O/nicj_cgp_outside_tenantdev.txt && ! grep -q "CGP joined" $O/nicj_cgp_outside_tenantdev.txt && [ "$(dl "$S0" "$S1" outside_use)" -ge 1 ]; } \
+  && mark nicj_outside_open_tenant_device_denied REQUIRED PASS "process outside the tenant cgroup (root, before joining): open($UVD) -> EPERM (outside_use+$(dl "$S0" "$S1" outside_use)); no fd of the tenant device can be prepared outside" \
+  || mark nicj_outside_open_tenant_device_denied REQUIRED FAIL "$(tail -1 $NJ)"
 
 # N10 an unsealed tenant-uid process cannot register itself
 B10=$(ngd | grep -c "^ENTRY"); $AMB $NP $NICJ_IBDEV forge $PIND > $O/nicj_forge.txt 2>&1; A10=$(ngd | grep -c "^ENTRY")

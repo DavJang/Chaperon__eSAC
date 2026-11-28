@@ -35,13 +35,26 @@ exercised by the functional verification.
 - Gated paths: the RDMA uverbs command interface of the mlx5 PMD — `open` of the uverbs character devices present when
   the gate is armed (matched by device number), and `ioctl`, compat `ioctl`, `mmap` and `write` on any file with the
   uverbs `file_operations` (also an fd opened before joining the cgroup, inherited across `exec`, or received over
-  `SCM_RIGHTS`). A uverbs device added after arming is not in the `open` list; `ioctl`/`mmap`/`write` on it are still
-  gated (same `file_operations`).
-- Not gated, not claimed: control of the VF netdev through the kernel network stack (netlink, socket ioctls, ethtool,
-  tc) with the tenant's `CAP_NET_ADMIN`; `AF_PACKET`/raw sockets with `CAP_NET_RAW` on the VF netdev; RDMA netlink;
-  event file descriptors derived from a uverbs context (async event / completion channel: other `file_operations`,
-  they deliver events and do not submit commands); NIC access paths of other drivers (VFIO, PCI resource files —
-  root-only device files, not used by the mlx5 PMD). Only the mlx5/uverbs path is implemented.
+  `SCM_RIGHTS`). Only the operator-selected device of the tenant is usable (by sealed tenant processes); other uverbs
+  devices are denied to every tenant process; the tenant device is denied to processes outside the tenant cgroup
+  (deny only, no kill). A uverbs device added after arming is not in the `open` list; `ioctl`/`mmap`/`write` on it are
+  still gated (same `file_operations`, device not selected).
+- **Unresolved: direct NIC programming by code inside a sealed process.** The Agent enforces at the PMD burst functions;
+  application code in the same (sealed) process can create its own queue on the tenant VF through verbs (or write to
+  the PMD's queues) and transmit without passing the Agent. Verified on the reference host: 20 raw frames sent by the
+  sealed tenant through a raw packet QP reached the peer VF (`NICQ=all`, `nicq_sealed_direct_verbs`). The kernel gate
+  cannot separate PMD code from application code of the same process; closing this needs a design change (not done).
+- Kernel network stack and other paths (Request Q): the tenant has no `CAP_NET_ADMIN` (netlink, socket ioctls, ethtool,
+  tc and RDMA-netlink changes fail with `EPERM`) and runs in a network namespace holding only `lo` and its VF netdev,
+  kept DOWN; `AF_PACKET`, raw and UDP sends cannot reach the NIC (verified with a peer-VF observer) and RoCE on the VF is
+  DOWN. `iopl`/`ioperm` fail (seccomp) and `/proc/bus/pci` is masked. Event fds derived from a uverbs context have no
+  command interface (`ioctl` `ENOTTY`, `mmap` `ENODEV`).
+- `CAP_SYS_RAWIO` stays (the mlx5 PMD loses ~60x TX throughput without it). Its port-I/O and `/proc/bus/pci` uses are
+  removed as above; its remaining uses are governed by root-only file permissions (`/dev/mem`, `/dev/port`, MSR
+  devices, PCI `resource*` files) or are not hardware access. That no other `CAP_SYS_RAWIO` path reaches the NIC was not
+  proven exhaustively. `devlink` writes were not exercised (they require `CAP_NET_ADMIN`, which the tenant lacks).
+- Without `CAP_NET_ADMIN` the mlx5 PMD cannot change netdev-level settings (MTU, promiscuous flag through netlink,
+  link up/down, VF MAC through the PF); the tested start-up, RX/TX, `rte_flow` and port restart do not need them.
 - `security_file_permission` runs for every `read`/`write` system call on the host; the gate program returns at once for
   other files. This cost is outside the tenant packet path (the forwarding lcore makes no system calls) and was not
   measured.
@@ -55,8 +68,8 @@ exercised by the functional verification.
 
 ## Not exercised by the functional verification
 
-- NIC gate: compat (32-bit) `ioctl`, `exec` from a non-leader thread, `vfork`/`clone(CLONE_VM)` children, the uverbs
-  `write` command path inside a DPDK tenant (tested with the kernel-level test only), applications other than
+- NIC gate: the uverbs `write` command path inside a DPDK tenant (tested with the kernel-level test only); a genuine
+  32-bit tenant binary (compat `ioctl` tested through `int $0x80` from a 64-bit process); applications other than
   `dpdk-testpmd` and dperf.
 
 - MPRQ RX burst variants (hooked, not selected in the tested configuration).
