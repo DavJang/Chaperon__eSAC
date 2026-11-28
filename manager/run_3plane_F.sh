@@ -56,7 +56,7 @@ mark(){ local n="$1" req="$2" st="$3"; shift 3
 refuse(){ mark "$1" REQUIRED FAIL "component init failure -> REFUSE launch (no untrusted workload)"; say "REFUSE: $1"; kill -9 ${TPID:-0} 2>/dev/null; cleanup
   sleep 1; local post="POST_REFUSE tenant_alive=$(kill -0 ${TPID:-0} 2>/dev/null && echo YES || echo NO) go_token=$( [ -e /var/lib/chap_gate/go_${TPID:-x} ] && echo PRESENT || echo absent) loader=$(pgrep -fc '[c]haperon_loader') sentinels=$(pgrep -fc '[r]s_sentinel_reuse|[i]nteg_sentinel_run') broker=$(pgrep -fc '[f]d_broker_multi') cgroup=$( [ -d /sys/fs/cgroup/chap_3pu_$RUN_ID ] && echo present || echo removed)"
   say "$post"; echo "$post" >> "${O:-/tmp}/refuse_post.txt" 2>/dev/null; final_verdict; exit 3; }
-cleanup(){ pkill -9 -f "chap3pu${$}" 2>/dev/null; pkill -9 -f "file-prefix=peer${$}" 2>/dev/null; rm -f /var/lib/chap_gate/go_${TPID:-x} /dev/shm/*chap3pu${$}* 2>/dev/null; if [ "$MT" = 1 ]; then for p in ${LPID:-} ${SPID:-} ${IPID:-} ${BRPID:-}; do kill -9 $p 2>/dev/null; done; else pkill -9 -f 'esac_l47ge[n]' 2>/dev/null; pkill -9 -f "[c]haperon_loader" 2>/dev/null; pkill -9 -f "[r]s_sentinel_reuse" 2>/dev/null; pkill -9 -f "[i]nteg_sentinel_run" 2>/dev/null; pkill -9 -f "[f]d_broker_multi" 2>/dev/null; fi; rmdir /sys/fs/cgroup/chap_3pu_$RUN_ID 2>/dev/null; rm -f $PIND/* 2>/dev/null; }   # Request I: release pinned maps
+cleanup(){ pkill -9 -f "chap3pu${$}" 2>/dev/null; pkill -9 -f "file-prefix=peer${$}" 2>/dev/null; rm -f /var/lib/chap_gate/go_${TPID:-x} /dev/shm/*chap3pu${$}* 2>/dev/null; if [ "$MT" = 1 ]; then for p in ${LPID:-} ${SPID:-} ${IPID:-} ${BRPID:-}; do kill -9 $p 2>/dev/null; done; else pkill -9 -f 'esac_l47ge[n]' 2>/dev/null; pkill -9 -f "[c]haperon_loader" 2>/dev/null; pkill -9 -f "[r]s_sentinel_reuse" 2>/dev/null; pkill -9 -f "[i]nteg_sentinel_run" 2>/dev/null; pkill -9 -f "[f]d_broker_multi" 2>/dev/null; fi; rmdir /sys/fs/cgroup/chap_3pu_$RUN_ID 2>/dev/null; rm -f $PIND/* 2>/dev/null; [ -n "${TNS:-}" ] && ip netns del $TNS 2>/dev/null; }   # Request I: release pinned maps; Request Q: tenant netns
 # Request G: a REQUIRED protection check that fails at the barrier refuses the launch: evidence snapshot while
 # the tenant is still held at the barrier, no GO token, tenant killed, Manager helpers cleaned up.
 refuse_at_barrier(){ local name="$1" det="$2" sn; sn=$(snap ${TPID:-0} 2>/dev/null); echo "$sn" > "$O/refuse_snapshot.txt"
@@ -87,7 +87,7 @@ L7ALW=""; grep -q '^allow ' "$RULES" && L7ALW="--l7-allowlist"   # allow-listed 
 cp "$MG/fabric/offsets.json" "$W/offsets.json"; chmod 0755 "$W"/*.so "$W/chaperon_loader" 2>/dev/null
 AGENT="$W/agent.so"; SERVER="$W/srv.so"
 MEMJ_LIB=""; [ -n "${MEMJ:-}" ] && { cp $CHAP_ROOT/tests/reqJ/chap_memapi_test.so "$W/memapi.so"; chmod 0755 "$W/memapi.so"; MEMJ_LIB="$W/memapi.so"; }   # Request J TEST-ONLY driver
-[ -n "${NICJ:-}" ] && { cp $CHAP_ROOT/tests/reqP/chap_nicgate_test.so "$W/nicj.so"; chmod 0755 "$W/nicj.so"; MEMJ_LIB="${MEMJ_LIB:+$MEMJ_LIB:}$W/nicj.so"; }   # Request P TEST-ONLY driver
+[ -n "${NICJ:-}${NICQ:-}" ] && { cp $CHAP_ROOT/tests/reqP/chap_nicgate_test.so "$W/nicj.so"; chmod 0755 "$W/nicj.so"; MEMJ_LIB="${MEMJ_LIB:+$MEMJ_LIB:}$W/nicj.so"; }   # Request P/Q TEST-ONLY driver
 mkdir -p "$DPDKRUN" 2>/dev/null; chmod 1777 "$DPDKRUN" 2>/dev/null
 
 # Request I: Table tab:apis attach points. Agent pre-check = public API entries (bpftime override);
@@ -116,11 +116,32 @@ bash "$MG/chap_admit.sh" "$QJSON" -- /bin/true -l $TLC --socket-mem 1024,0 >"$W/
 if [ "$MT" = 1 ]; then INTRA_SVF=$MT_SVF; INTRA_CVF=$MT_CVF; else eval "$(bash "$MG/fabric/setup_mlx5_fabric.sh" | grep INTRA_)"; fi
 SVF=${INTRA_SVF:-}; CVF=${INTRA_CVF:-}; CVFMAC=$(cat /sys/bus/pci/devices/${INTRA_CVF:-x}/net/*/address 2>/dev/null | head -1); [ -z "$SVF" ] && { mark fabric REQUIRED FAIL "no mlx5 VF"; final_verdict; exit 1; }
 say "fabric SVF=$SVF CVF=$CVF SHM=$SHM RUN_ID=$RUN_ID"
+# Request Q: the tenant runs in its own network namespace holding only lo and its VF netdev, kept DOWN (the mlx5 PMD
+# needs the netdev for queries; its packets use the DevX queues, not the kernel netdev). The PF, the representors and
+# every host interface are invisible to the tenant, and without CAP_NET_ADMIN it cannot bring the netdev up: no
+# AF_PACKET / raw / UDP path to the NIC through the kernel network stack. /proc/bus/pci is masked in its mount namespace.
+TNS=""; NSX=""
+if [ "${TNETNS:-1}" = 1 ]; then
+  SN=$(ls /sys/bus/pci/devices/$SVF/net/ 2>/dev/null | head -1); TNS=chapns${$}
+  if [ -n "$SN" ] && ip netns add $TNS && ip link set "$SN" netns $TNS && ip netns exec $TNS ip link set "$SN" down && ip netns exec $TNS ip link set lo up; then
+    NSX="$MG/tools/tenant_ns_exec.sh $TNS"
+    mark tenant_netns REQUIRED PASS "netns $TNS: $(ip netns exec $TNS ip -br link | tr -s ' ' | tr '\n' ';') (VF netdev $SN DOWN; PF, representors, host interfaces not in the namespace); /proc/bus/pci masked in the tenant mount namespace"
+  else mark tenant_netns REQUIRED FAIL "netns setup failed (SN=$SN)"; ip netns del $TNS 2>/dev/null; final_verdict; exit 3; fi
+fi
 
 FIFO=$W/cmd; mkfifo "$FIFO"; RP=$O/tpid; :>"$RP"; chmod 666 "$RP"
 NICJ_IBDEV=$(ls /sys/bus/pci/devices/$SVF/infiniband/ 2>/dev/null | head -1)   # RDMA device of the tenant VF (Request P tests)
-AENV="XDG_RUNTIME_DIR=$DPDKRUN $( [ -n "${NICJ:-}" ] && echo "CHAP_NICJ_TEST=1 CHAP_NICJ_DIR=$W/tenant_cwd CHAP_NICJ_IBDEV=$NICJ_IBDEV" ) BPFTIME_GLOBAL_SHM_NAME=$SHM BPFTIME_LOG_OUTPUT=console SPDLOG_LEVEL=${TSPDLOG:-warn} BPFTIME_KERNEL_MAP_NAMES=comm_policy,resource_usage,resource_policy BPFTIME_KERNEL_MAP_RO=1 BPFTIME_FD_BROKER_SOCK=$SOCK BPFTIME_KERNEL_MAP_DROP_FD=1 ESAC_HS_PATTERNS=$W/hs_rules.txt ESAC_MATCH_ACT=2 CHAP_GATED_LAUNCH=1 $( [ "${FAIL_INJECT:-}" = view_unsealed ] || echo CHAP_IMM_VIEW=1 ) CHAP_L7_REQUIRED=1 CHAP_GO_TIMEOUT_S=90 CHAP_GO_DIR=/var/lib/chap_gate CHAP_LINK_REGISTRY=1 CHAP_TEST_ATK=$( [ "${PROGFN_ATK:-0}" = 1 -o "${DISPATCH_ATK:-0}" = 1 ] && echo 1 || echo 0 ) $( [ "${SEALED_DISPATCH:-1}" = 1 ] && echo CHAP_SEALED_DISPATCH=1 ) $( [ -n "${MEMJ:-}" ] && echo "CHAP_MEMAPI_TEST=1 CHAP_MEMAPI_DIR=$W/tenant_cwd CHAP_MEMAPI_GATE_OFF=$GOFF" ) LD_DEBUG=files LD_PRELOAD=$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}"
-TUSER=$(id -nu "${SUDO_UID:-1003}")
+AENV="XDG_RUNTIME_DIR=$DPDKRUN $( [ -n "${NICJ:-}${NICQ:-}" ] && echo "CHAP_NICJ_TEST=1 CHAP_NICJ_DIR=$W/tenant_cwd CHAP_NICJ_IBDEV=$NICJ_IBDEV" ) BPFTIME_GLOBAL_SHM_NAME=$SHM BPFTIME_LOG_OUTPUT=console SPDLOG_LEVEL=${TSPDLOG:-warn} BPFTIME_KERNEL_MAP_NAMES=comm_policy,resource_usage,resource_policy BPFTIME_KERNEL_MAP_RO=1 BPFTIME_FD_BROKER_SOCK=$SOCK BPFTIME_KERNEL_MAP_DROP_FD=1 ESAC_HS_PATTERNS=$W/hs_rules.txt ESAC_MATCH_ACT=2 CHAP_GATED_LAUNCH=1 $( [ "${FAIL_INJECT:-}" = view_unsealed ] || echo CHAP_IMM_VIEW=1 ) CHAP_L7_REQUIRED=1 CHAP_GO_TIMEOUT_S=90 CHAP_GO_DIR=/var/lib/chap_gate CHAP_LINK_REGISTRY=1 CHAP_TEST_ATK=$( [ "${PROGFN_ATK:-0}" = 1 -o "${DISPATCH_ATK:-0}" = 1 ] && echo 1 || echo 0 ) $( [ "${SEALED_DISPATCH:-1}" = 1 ] && echo CHAP_SEALED_DISPATCH=1 ) $( [ -n "${MEMJ:-}" ] && echo "CHAP_MEMAPI_TEST=1 CHAP_MEMAPI_DIR=$W/tenant_cwd CHAP_MEMAPI_GATE_OFF=$GOFF" ) LD_DEBUG=files LD_PRELOAD=$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}"
+# Request Q: dedicated tenant account from manager/chap_env.sh (CHAP_TENANT_USER): not root, no sudo rights, no
+# administrative group. amblaunch drops to it (exported), with NO_NEW_PRIVS. The DPDK runtime dir belongs to it.
+TUSER=${CHAP_TENANT_USER:-}
+TACC=$(LC_ALL=C sudo -n -l -U "${TUSER:-root}" 2>&1 | head -1); TGR=$(id -nG "${TUSER:-root}" 2>/dev/null)
+if [ -n "$TUSER" ] && [ "$(id -u "$TUSER" 2>/dev/null || echo 0)" != 0 ] && echo "$TACC" | grep -q "is not allowed to run sudo" \
+   && ! echo " $TGR " | grep -qE " (sudo|admin|wheel|root|adm|libvirt|docker|lxd|kvm|disk) "; then
+  mark tenant_account REQUIRED PASS "tenant=$TUSER uid=$(id -u $TUSER) groups=[$TGR] ; $TACC"
+else mark tenant_account REQUIRED FAIL "tenant='$TUSER' groups=[$TGR] ; $TACC (set CHAP_TENANT_USER to a dedicated unprivileged account)"; cleanup; final_verdict; exit 3; fi
+export CHAP_TENANT_USER="$TUSER"
+mkdir -p "$DPDKRUN" && chown "$TUSER" "$DPDKRUN" && chmod 0700 "$DPDKRUN"
 python3 -I "$MG/chap_e_tools.py" libtrust "$TUSER" "$TESTPMD" "$AGENT:$W/esac_seal.so:$W/hsprov.so${MEMJ_LIB:+:$MEMJ_LIB}" > "$O/lib_trust.txt" 2>&1; LTR=$?
 LT="$(grep LIBTRUST_RESULT $O/lib_trust.txt)"
 if [ "$LTR" = 0 ]; then mark pre_bootstrap_code_trust REQUIRED PASS "$LT; tenant=$TUSER; preloads + Manager artifacts in root-owned 0755 $W"
@@ -130,7 +151,7 @@ python3 -I "$MG/chap_e_tools.py" exetrust "$TESTPMD" > "$O/exe_trust.txt" 2>&1 \
   || { mark exe_no_prebarrier_code REQUIRED FAIL "$(cat $O/exe_trust.txt | tr '\n' ' ')"; cleanup; final_verdict; exit 3; }
 TCWD=$W/tenant_cwd; mkdir -p "$TCWD"; chown "$TUSER" "$TCWD"; chmod 0700 "$TCWD"   # tenant working dir (PMD debug dumps land here, not in the repo)
 TXMF=""; [ "${TX_TEST:-0}" = "1" ] && TXMF="--txonly-multi-flow"
-setsid $AMB bash -c "echo \$\$>$RP; kill -STOP \$\$; cd $TCWD; exec stdbuf -oL env $AENV $TESTPMD -l $TLC -n4 --in-memory --socket-mem 1024,0 -a ${SVF},rx_vec_en=${RXVEC:-0} --file-prefix=chap3pu${$} -- -i --total-num-mbufs=4096 --tx-ip=10.0.0.2,10.0.0.1 --tx-udp=2222,1111 $TXMF" < "$FIFO" > "$W/testpmd.log" 2>&1 &
+setsid $NSX $AMB bash -c "echo \$\$>$RP; kill -STOP \$\$; cd $TCWD; exec stdbuf -oL env $AENV $TESTPMD -l $TLC -n4 --in-memory --socket-mem 1024,0 -a ${SVF},rx_vec_en=${RXVEC:-0} --file-prefix=chap3pu${$} -- -i --total-num-mbufs=4096 --tx-ip=10.0.0.2,10.0.0.1 --tx-udp=2222,1111 $TXMF" < "$FIFO" > "$W/testpmd.log" 2>&1 &
 LJOB=$!
 exec 3>"$FIFO"; sleep 1; TPID=$(cat "$RP")
 say "tenant pid=$TPID (STOPPED) uid=$(awk '/^Uid:/{print $2}' /proc/$TPID/status 2>/dev/null)"
@@ -199,7 +220,7 @@ grep -qa "READY" "$O/integ.log" || refuse "integrity_sentinel_attach"; mark inte
 # interface) armed BEFORE the tenant is released: until the Manager registers it as a Sealed Process, any tenant-cgroup
 # access to the operator-selected RDMA devices is denied in-kernel + SIGKILL. Missing hook or config => refuse.
 NGA=$(grep -aoE "NICGATE attached=[0-9]+/[0-9]+" "$O/integ.log" | head -1)
-{ [ "$NGA" = "NICGATE attached=8/8" ] && "$IK/chap_nicgate" cfg "$PIND" on > "$O/nicgate_cfg.txt" 2>&1; } \
+{ [ "$NGA" = "NICGATE attached=8/8" ] && "$IK/chap_nicgate" cfg "$PIND" on "$NICJ_IBDEV" > "$O/nicgate_cfg.txt" 2>&1; } \
   && mark nic_gate_armed REQUIRED PASS "$NGA (fmod_ret security_file_open/ioctl/ioctl_compat/mmap_file/file_permission + sched fork/exec/exit) ; $(cat $O/nicgate_cfg.txt)" \
   || { mark nic_gate_armed REQUIRED FAIL "${NGA:-no NICGATE line} ; $(cat $O/nicgate_cfg.txt 2>/dev/null)"; refuse "nic_gate_arm"; }
 tl SENTINELS_READY resource-kernel-sentinel+tamper-sentinel+nic-gate
@@ -238,6 +259,13 @@ if [ "$IDOK" = 1 ] && [ "$B_fd_bpfmap" = 0 ] && [ "$B_fd_nic" = 0 ] && [ "$B_fd_
    && [ "$B_rwx" = 0 ] && [ "$B_maps_huge" = 0 ] && [ "$B_EAL_lines" = 0 ] && [ "$B_initialize_program" = 0 ] && [ "$B_rsrc_api_calls" = 0 ]; then
   mark launch_barrier_independent REQUIRED PASS "Manager /proc+bpftool at barrier: map ids comm=$CKID usage=$UID_ policy=$PID_ match; $SN"
 else mark launch_barrier_independent REQUIRED FAIL "ids_match=$IDOK; $SN"; refuse "launch_barrier_independent"; fi
+# Request Q: tenant privileges read from the kernel at the barrier (before any tenant code runs)
+TST=/proc/$TPID/status; TU=$(id -u "$TUSER"); TCAP=0000000000022000
+TPRIV="uid=[$(awk '/^Uid:/{print $2,$3,$4,$5}' $TST)] gid=[$(awk '/^Gid:/{print $2,$3,$4,$5}' $TST)] groups=[$(awk '/^Groups:/{$1="";print}' $TST | xargs)] NoNewPrivs=$(awk '/^NoNewPrivs:/{print $2}' $TST) Seccomp=$(awk '/^Seccomp:/{print $2}' $TST) CapPrm=$(awk '/^CapPrm:/{print $2}' $TST) CapEff=$(awk '/^CapEff:/{print $2}' $TST) CapAmb=$(awk '/^CapAmb:/{print $2}' $TST) netns=$(readlink /proc/$TPID/ns/net)"
+{ echo "$TPRIV" | grep -q "uid=\[$TU $TU $TU $TU\]" && echo "$TPRIV" | grep -q "groups=\[\]" && echo "$TPRIV" | grep -q "NoNewPrivs=1 Seccomp=2 CapPrm=$TCAP CapEff=$TCAP CapAmb=$TCAP" \
+  && { [ -z "$TNS" ] || [ "$(readlink /proc/$TPID/ns/net)" = "$(ip netns exec $TNS readlink /proc/self/ns/net)" ]; }; } \
+  && mark tenant_privileges REQUIRED PASS "$TPRIV (caps = CAP_NET_RAW|CAP_SYS_RAWIO; seccomp denies iopl/ioperm)" \
+  || refuse_at_barrier tenant_privileges "$TPRIV"
 SLOG=/tmp/esac_seal_$TPID.log
 SEALED=$(grep -ac "SEAL rwx->r-x" "$SLOG" 2>/dev/null); SFAIL=$(grep -a "SEAL_DONE" "$SLOG"|tail -1|grep -oE "fail=[0-9]+"|grep -oE "[0-9]+")
 UFS=$(grep -ac "ENFSEAL ufunc_ctx verify direct_write=FAULTED" "$SLOG" 2>/dev/null)
@@ -602,6 +630,7 @@ fi
 
 [ -n "${MEMJ:-}" ] && . "$MG/reqJ_memrate_block.sh"   # Request J: memory-API rate at the sealed-dispatch boundary
 [ -n "${NICJ:-}" ] && . "$MG/reqP_nicgate_block.sh"   # Request P: Sealed-Process NIC gate (TEST-ONLY driver)
+[ -n "${NICQ:-}" ] && . "$MG/reqQ_nicgate_block.sh"   # Request Q: privileges, non-uverbs NIC paths, lifecycle (TEST-ONLY driver)
 if [ "${RESAPI:-0}" = "1" ]; then   # Request I: Table tab:apis at runtime (live Manager policy updates)
   . "$MG/reqI_resapi_block.sh"
   [ -n "${RESAPI_BYPASS:-}" ] && { final_verdict; cleanup; echo 0 > /sys/bus/pci/devices/0000:3b:00.1/sriov_numvfs 2>/dev/null; say "3PU_DONE RUN_ID=$RUN_ID logs in $O"; exit 0; }
@@ -627,7 +656,7 @@ fi
 python3 -I "$MG/chap_e_tools.py" timeline "$O/timeline_mgr.txt" "$W/testpmd.log" "$W/testpmd.log" > "$O/timeline.txt" 2>&1; TLR=$?
 [ "$TLR" = 0 ] && mark launch_timeline REQUIRED PASS "$(grep TIMELINE_RESULT $O/timeline.txt)" || mark launch_timeline REQUIRED FAIL "$(grep -E 'TIMELINE_RESULT|STREAM_ORDER' $O/timeline.txt | tr '\n' ' ')"
 echo "quit" >&3 2>/dev/null; exec 3>&- 2>/dev/null; sleep 2
-if [ -n "${NICJ:-}" ]; then   # Request P: the sealed entry disappears with the process (no stale status for a later PID)
+if [ -n "${NICJ:-}${NICQ:-}" ]; then   # Request P: the sealed entry disappears with the process (no stale status for a later PID)
   for w in $(seq 1 20); do kill -0 $TPID 2>/dev/null || break; sleep 0.5; done
   TA=$(kill -0 $TPID 2>/dev/null && echo YES || echo NO); "$IK/chap_nicgate" dump "$PIND" > "$O/nicgate_after_exit.txt" 2>&1
   { [ "$TA" = NO ] && ! grep -q "^ENTRY pid=$TPID " "$O/nicgate_after_exit.txt"; } \

@@ -4,8 +4,10 @@
 # with the tenant's ambient capabilities (amblaunch). Independent witness: kprobes on the uverbs HANDLERS
 # (ib_uverbs_open/ioctl/mmap/write) show whether a call reached the RDMA command interface at all.
 set -u
-B=${B:-/home/sungwoo/chaperon_reqP}; IK=$B/integrity/kernel; NP=$B/tests/reqP/nicprobe; AMB=$B/manager/tools/amblaunch
-IBDEV=${IBDEV:-rocep59s0f1v0}
+B=${B:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}; IK=$B/integrity/kernel; NP=$B/tests/reqP/nicprobe; AMB=$B/manager/tools/amblaunch
+[ -f "$B/manager/chap_env.sh" ] && . "$B/manager/chap_env.sh"; export CHAP_TENANT_USER   # Request Q: dedicated tenant account
+IBDEV=${IBDEV:-rocep59s0f1v0}      # the tenant's (operator-selected) RDMA device
+OIB=${OIB:-rocep59s0f1v1}          # another VF's RDMA device (Request Q)
 R=${R:-/home/sungwoo/chaperon_results/reqP_20261128/unit}; mkdir -p $R; cd $R
 CG=/sys/fs/cgroup/reqp_unit_$$; mkdir $CG; CGID=$(stat -c %i $CG)
 PIND=/sys/fs/bpf/chap_reqp_unit_$$; mkdir -p $PIND
@@ -17,19 +19,22 @@ trap cleanup EXIT
 $IK/integ_sentinel_run $IK/integrity_sentinel.bpf.o $CGID $PIND > integ.log 2>&1 & SP=$!
 for i in $(seq 1 20); do grep -q READY integ.log && break; sleep 0.5; done
 say "SENTINEL $(grep -o 'NICGATE attached=[0-9/]*' integ.log) $(grep -c READY integ.log) READY; obj=$(sha256sum $IK/integrity_sentinel.bpf.o | cut -c1-8)"
-$IK/chap_nicgate cfg $PIND on > cfg.log 2>&1; say "$(cat cfg.log)"
+$IK/chap_nicgate cfg $PIND on $IBDEV > cfg.log 2>&1; say "$(cat cfg.log)"
 printf 'kprobe:ib_uverbs_open,kprobe:ib_uverbs_ioctl,kprobe:ib_uverbs_mmap,kprobe:ib_uverbs_write /comm == "nicprobe"/ { printf("%%llu %%s pid=%%d\\n", nsecs, func, pid); }\ntracepoint:sched:sched_process_exec /comm == "nicprobe"/ { printf("%%llu EXEC pid=%%d\\n", nsecs, pid); }\n' > uv.bt
 bpftrace uv.bt > uv_trace.txt 2>&1 & BT=$!
 for i in $(seq 1 40); do grep -q Attaching uv_trace.txt && break; sleep 0.5; done; sleep 1
 dump(){ $IK/chap_nicgate dump $PIND; }
 handler_calls(){ grep -c " $2 pid=$1\$" uv_trace.txt; }                       # $1 pid  $2 ib_uverbs_*
-after_exec(){ local p=$1 f=$2 t; t=$(grep "EXEC pid=$p$" uv_trace.txt | tail -1 | awk '{print $1}');   # LAST exec (the first is the launch into nicprobe) [ -z "$t" ] && { echo NA; return; }
+after_exec(){ local p=$1 f=$2 t; t=$(grep "EXEC pid=$p$" uv_trace.txt | tail -1 | awk '{print $1}'); [ -z "$t" ] && { echo NA; return; }   # LAST exec (the first is the launch into nicprobe)
   awk -v t=$t -v p="pid=$p" -v f=$f '$1>t && $2==f && $3==p' uv_trace.txt | wc -l; }
 incg(){ bash -c "echo \$\$ > $CG/cgroup.procs; exec $AMB $NP $IBDEV $*"; }   # tenant uid + caps, inside the cgroup
 
-# T1 scope: a process OUTSIDE the protected cgroup is not affected
-$AMB $NP $IBDEV open close > t1.out 2>&1; R1=$?
-judge T1_outside_cgroup_unaffected $( grep -q "OPEN RESULT ok" t1.out && [ $R1 = 0 ] && echo 1 || echo 0 ) "rc=$R1 $(tr '\n' ' ' < t1.out | cut -c1-160)"
+# T1 scope: a process OUTSIDE the protected cgroup is not affected on a device that is not the tenant's
+$AMB $NP $OIB open close > t1.out 2>&1; R1=$?
+judge T1_outside_cgroup_other_device_unaffected $( grep -q "OPEN RESULT ok" t1.out && [ $R1 = 0 ] && echo 1 || echo 0 ) "dev=$OIB rc=$R1 $(tr '\n' ' ' < t1.out | cut -c1-160)"
+# T1b (Request Q) the tenant's selected device used by a process OUTSIDE the tenant cgroup: denied (-EPERM), not killed
+$AMB $NP $IBDEV open close > t1b.out 2>&1; R1B=$?; P1B=$(grep -oE "begin pid=[0-9]+" t1b.out | grep -oE "[0-9]+" | head -1)
+judge T1b_outside_cgroup_tenant_device_denied $( [ $R1B = 0 ] && grep -q "open_device FAIL" t1b.out && [ "$(handler_calls $P1B ib_uverbs_open)" = 0 ] && echo 1 || echo 0 ) "dev=$IBDEV rc=$R1B $(tr '\n' ' ' < t1b.out | cut -c1-200) ib_uverbs_open(pid $P1B)=$(handler_calls $P1B ib_uverbs_open)"
 
 # T2 unsealed tenant process: open denied before the handler + SIGKILL
 incg open > t2.out 2>&1; R2=$?; P2=$(grep -oE "begin pid=[0-9]+" t2.out | grep -oE "[0-9]+" | head -1)
@@ -91,4 +96,4 @@ echo go >&7; wait $J8; R8=$?; exec 7>&-; S1=$(dump | tail -1)
 judge T8_reused_pid_stale_entry_rejected $( [ $R8 = 137 ] && ! dump | grep -q "ENTRY pid=$P8 " && [ "$(handler_calls $P8 ib_uverbs_open)" = 0 ] && echo 1 || echo 0 ) \
   "$(cat t8_put.txt) rc=$R8 ib_uverbs_open=$(handler_calls $P8 ib_uverbs_open) before=[$S0] after=[$S1]"
 say "FINAL $(dump | tail -1)"
-say "UNIT SUMMARY: $(grep -c ' PASS ' $RES) PASS, $(grep -c ' FAIL ' $RES) FAIL"
+say "UNIT SUMMARY: $(grep -c '^TEST [^ ]* PASS ::' $RES) PASS, $(grep -c '^TEST [^ ]* FAIL ::' $RES) FAIL"   # verdict field only (messages may contain FAIL)

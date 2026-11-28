@@ -17,6 +17,7 @@ resource/kernel/rs_concurrency_test
 resource/manager/chap_res_policy
 integrity/kernel/chap_nicgate
 tests/reqP/nicprobe
+tests/reqQ/netpath_probe
 integrity/kernel/integ_sentinel_run
 integrity/kernel/integ_setranges
 integrity/kernel/tamper_child

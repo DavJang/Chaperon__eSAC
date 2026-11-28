@@ -1,6 +1,7 @@
-// Chaperon Request P -- Manager tool for the kernel Sentinel's sealed-process registry and NIC gate (root only:
+// Chaperon Request P (+Q: selected device, foreign/outside counters) -- Manager tool for the kernel Sentinel's sealed-process registry and NIC gate (root only:
 // the maps are pinned under the root-only bpffs directory and the tenant has no bpf() access).
-//   chap_nicgate cfg   <pindir> on|off      uverbs fops (/proc/kallsyms) + uverbs device numbers (sysfs) -> nicgate_cfg
+//   chap_nicgate cfg   <pindir> on|off <ibdev>[,<ibdev>...]   uverbs fops (/proc/kallsyms) + all uverbs device numbers
+//                      (sysfs) + the operator-selected RDMA device(s) of the tenant (Request Q) -> nicgate_cfg
 //   chap_nicgate seal  <pindir> <tgid>      register a sealed process (identity: tgid + /proc start time)
 //   chap_nicgate unseal <pindir> <tgid>
 //   chap_nicgate dump  <pindir>             sealed entries + gate counters
@@ -16,7 +17,19 @@
 
 #define NG_MAXDEV 16
 struct sproc { unsigned long long start_ticks; unsigned int origin, parent; unsigned long long reg_ns; };
-struct ngcfg { unsigned long long fops0, fops1; unsigned int enabled, ndev; unsigned int dev[NG_MAXDEV]; };
+struct ngcfg { unsigned long long fops0, fops1; unsigned int enabled, ndev; unsigned int dev[NG_MAXDEV]; unsigned int nsel, pad; unsigned int sel[NG_MAXDEV]; };
+static int ibdev_rdev(const char *ib, unsigned int *out)
+{   /* /sys/class/infiniband/<ib>/device/infiniband_verbs/uverbsN/dev -> kernel dev_t (major<<20|minor) */
+    char p[300]; snprintf(p, sizeof p, "/sys/class/infiniband/%s/device/infiniband_verbs", ib);
+    DIR *d = opendir(p); struct dirent *e; int r = -1;
+    while (d && (e = readdir(d))) {
+        if (strncmp(e->d_name, "uverbs", 6)) continue;
+        char q[600]; snprintf(q, sizeof q, "%s/%s/dev", p, e->d_name); FILE *f = fopen(q, "r"); unsigned int ma, mi;
+        if (f && fscanf(f, "%u:%u", &ma, &mi) == 2) { *out = (ma << 20) | mi; r = 0; }
+        if (f) fclose(f); if (!r) break;
+    }
+    if (d) closedir(d); return r;
+}
 struct ngstat { unsigned long long v[16]; };
 
 static int pinfd(const char *dir, const char *name)
@@ -63,12 +76,19 @@ int main(int argc, char **argv)
         }
         if (d) closedir(d);
         c.enabled = (argc > 3 && !strcmp(argv[3], "on")) ? 1 : 0;
-        if (c.enabled && (!c.fops0 || !c.fops1 || !c.ndev)) { fprintf(stderr, "NICGATE_CFG FAIL fops0=%llx fops1=%llx ndev=%u\n", c.fops0, c.fops1, c.ndev); return 1; }
+        if (argc > 4) {   /* operator-selected RDMA device(s) of the tenant */
+            char lst[512]; snprintf(lst, sizeof lst, "%s", argv[4]);
+            for (char *s = strtok(lst, ","); s && c.nsel < NG_MAXDEV; s = strtok(NULL, ","))
+                if (ibdev_rdev(s, &c.sel[c.nsel])) { fprintf(stderr, "NICGATE_CFG FAIL no uverbs node for %s\n", s); return 1; } else c.nsel++;
+        }
+        if (c.enabled && (!c.fops0 || !c.fops1 || !c.ndev || !c.nsel)) { fprintf(stderr, "NICGATE_CFG FAIL fops0=%llx fops1=%llx ndev=%u nsel=%u (selected device required)\n", c.fops0, c.fops1, c.ndev, c.nsel); return 1; }
         unsigned int z = 0;
         if (bpf_map_update_elem(fd, &z, &c, BPF_ANY)) { perror("update nicgate_cfg"); return 1; }
         struct ngcfg rb; if (bpf_map_lookup_elem(fd, &z, &rb) || memcmp(&rb, &c, sizeof c)) { fprintf(stderr, "NICGATE_CFG readback mismatch\n"); return 1; }
         printf("NICGATE_CFG enabled=%u uverbs_fops=0x%llx uverbs_mmap_fops=0x%llx uverbs_devs=%u [", c.enabled, c.fops0, c.fops1, c.ndev);
         for (unsigned i = 0; i < c.ndev; i++) printf("%s%u:%u", i ? " " : "", c.dev[i] >> 20, c.dev[i] & 0xfffff);
+        printf("] selected=%s [", argc > 4 ? argv[4] : "-");
+        for (unsigned i = 0; i < c.nsel; i++) printf("%s%u:%u", i ? " " : "", c.sel[i] >> 20, c.sel[i] & 0xfffff);
         printf("]\n"); return 0;
     }
     if (!strcmp(cmd, "seal") || !strcmp(cmd, "put")) {
@@ -103,8 +123,8 @@ int main(int argc, char **argv)
         long nc = sysconf(_SC_NPROCESSORS_CONF); struct ngstat *pc = calloc(nc, sizeof *pc); unsigned int z = 0;
         unsigned long long t[16] = {0};
         if (!bpf_map_lookup_elem(sf, &z, pc)) for (long c = 0; c < nc; c++) for (int i = 0; i < 16; i++) t[i] += pc[c].v[i];
-        printf("NICGATE_STATS entries=%d allow{open=%llu ioctl=%llu ioctl32=%llu mmap=%llu write=%llu} deny{open=%llu ioctl=%llu ioctl32=%llu mmap=%llu write=%llu} fork_inherit=%llu exec_unseal=%llu exit_clear=%llu stale_removed=%llu\n",
-               n, t[2], t[4], t[6], t[8], t[10], t[3], t[5], t[7], t[9], t[11], t[12], t[13], t[14], t[15]);
+        printf("NICGATE_STATS entries=%d allow{open=%llu ioctl=%llu ioctl32=%llu mmap=%llu write=%llu} deny{open=%llu ioctl=%llu ioctl32=%llu mmap=%llu write=%llu} fork_inherit=%llu exec_unseal=%llu exit_clear=%llu stale_removed=%llu foreign_dev=%llu outside_use=%llu\n",
+               n, t[2], t[4], t[6], t[8], t[10], t[3], t[5], t[7], t[9], t[11], t[12], t[13], t[14], t[15], t[0], t[1]);
         return 0;
     }
     fprintf(stderr, "unknown command %s\n", cmd); return 2;

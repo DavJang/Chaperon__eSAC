@@ -12,6 +12,8 @@
 //   forkexec <path> [args...]  fork; the child execs (rest of line); the parent waits and reports exit/signal
 //   sockpair              create a socketpair (fds printed); sendfd <sock> <fd>; recvfd <sock> -> prints received fd
 //   forge <pindir>        try to obtain and write the pinned sealed_procs map (must fail for the tenant)
+//   (Request Q) fdioctl32 <fd>  compat ioctl (int $0x80) | evfd <fd>  ioctl/mmap/read/write on a derived event fd |
+//   recv_import <sockpath> <s>  receive a uverbs cmd fd over a unix socket, ibv_import_device + alloc_pd + create_cq
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -26,7 +28,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -150,6 +154,38 @@ int main(int argc, char **argv)
             memset(&a, 0, sizeof a); a.map_id = 1; long f2 = syscall(SYS_bpf, BPF_MAP_GET_FD_BY_ID, &a, sizeof a);
             P("FORGE map_get_fd_by_id ret=%ld errno=%d (%s)\n", f2, f2 < 0 ? errno : 0, f2 < 0 ? strerror(errno) : "-");
             int pf = open(p, O_RDWR); P("FORGE open(pin) ret=%d errno=%d (%s)\n", pf, pf < 0 ? errno : 0, pf < 0 ? strerror(errno) : "-");
+        }
+        /* ---- Request Q ---- */
+        else if (!strcmp(s, "fdioctl32") && i + 1 < argc) {   /* compat (ia32) ioctl via int $0x80 from a 64-bit process */
+            int fd = atoi(argv[++i]); P("FDIOCTL32 begin fd=%d pid=%d\n", fd, getpid());
+            long r; __asm__ volatile("int $0x80" : "=a"(r) : "a"(54L), "b"((long)fd), "c"((long)RDMA_VERBS_IOCTL), "d"(0L) : "memory", "r8", "r9", "r10", "r11");
+            P("FDIOCTL32 ret=%ld\n", r);
+        }
+        else if (!strcmp(s, "evfd") && i + 1 < argc) {   /* event fd derived from a uverbs context: no command interface */
+            int fd = atoi(argv[++i]); char lk[128] = "", pp[64]; snprintf(pp, sizeof pp, "/proc/self/fd/%d", fd); ssize_t n = readlink(pp, lk, sizeof lk - 1); if (n > 0) lk[n] = 0;
+            struct ib_uverbs_ioctl_hdr h; memset(&h, 0, sizeof h); h.length = sizeof h;
+            int r1 = ioctl(fd, RDMA_VERBS_IOCTL, &h), e1 = r1 < 0 ? errno : 0;
+            void *m = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0); int e2 = m == MAP_FAILED ? errno : 0;
+            fcntl(fd, F_SETFL, O_NONBLOCK); char b[64]; ssize_t r3 = read(fd, b, sizeof b); int e3 = r3 < 0 ? errno : 0;
+            ssize_t r4 = write(fd, b, 16); int e4 = r4 < 0 ? errno : 0;
+            P("EVFD fd=%d target=%s ioctl=%d errno=%d(%s) mmap=%s errno=%d(%s) read=%zd errno=%d(%s) write=%zd errno=%d(%s)\n", fd, lk, r1, e1, strerror(e1),
+              m == MAP_FAILED ? "FAIL" : "ok", e2, strerror(e2), r3, e3, strerror(e3), r4, e4, strerror(e4));
+        }
+        else if (!strcmp(s, "recv_import") && i + 2 < argc) {   /* receive a uverbs cmd fd over a unix socket and use it */
+            const char *path = argv[++i]; int secs = atoi(argv[++i]); unlink(path);
+            int ls = socket(AF_UNIX, SOCK_STREAM, 0); struct sockaddr_un a = { .sun_family = AF_UNIX }; snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+            int br = bind(ls, (struct sockaddr *)&a, sizeof a); chmod(path, 0777); listen(ls, 1); P("RECVIMPORT listening %s bind=%d pid=%d\n", path, br, getpid());
+            alarm(secs); int cs = accept(ls, NULL, NULL); char c; struct iovec io = {&c, 1}; char cb[CMSG_SPACE(sizeof(int))];
+            struct msghdr m = {0}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+            ssize_t r = cs >= 0 ? recvmsg(cs, &m, 0) : -1; int fd = -1; struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+            if (r > 0 && h && h->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(h), sizeof(int)); alarm(0);
+            P("RECVIMPORT got fd=%d\n", fd);
+            if (fd >= 0) {
+                P("RECVIMPORT import begin\n"); struct ibv_context *ctx = ibv_import_device(fd);
+                P("RECVIMPORT import=%s errno=%d\n", ctx ? "ok" : "FAIL", ctx ? 0 : errno);
+                if (ctx) { struct ibv_pd *pd = ibv_alloc_pd(ctx); P("RECVIMPORT alloc_pd=%s\n", pd ? "ok" : "FAIL");
+                           struct ibv_cq *cq = ibv_create_cq(ctx, 16, NULL, NULL, 0); P("RECVIMPORT create_cq=%s (NIC command on the tenant's context executed)\n", cq ? "ok" : "FAIL"); }
+            }
         }
         else { P("UNKNOWN step %s\n", s); }
     }

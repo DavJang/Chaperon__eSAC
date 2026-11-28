@@ -5,8 +5,12 @@
 # (built by agent/build_runtime.sh). The launcher refuses to start without it.
 CHAP_RUNTIME_DIR=/path/to/chaperon-runtime
 
-# XDG_RUNTIME_DIR of the non-root DPDK tenant (created with mode 1777 by the launcher).
-CHAP_DPDK_RUNDIR=/var/tmp/chap_dpdkrun
+# Dedicated tenant account (required): not root, no sudo rights, no administrative group (the launcher refuses
+# otherwise). amblaunch drops to it with CAP_NET_RAW + CAP_SYS_RAWIO, NO_NEW_PRIVS and an iopl/ioperm seccomp filter.
+CHAP_TENANT_USER=chaptenant
+
+# XDG_RUNTIME_DIR of the non-root DPDK tenant (the launcher makes it owned by the tenant account, mode 0700).
+CHAP_DPDK_RUNDIR=/var/tmp/chap_dpdkrun_chaptenant
 
 # LD_LIBRARY_PATH for the DPDK peer/generator processes (empty: system default).
 CHAP_DPDK_LIBDIR=

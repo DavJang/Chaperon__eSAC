@@ -178,24 +178,33 @@ int BPF_KPROBE(integ_do_madvise, void *mm, unsigned long start, unsigned long le
  * Identity = tgid + start time in clock ticks (same unit as /proc/<pid>/stat field 22), so a reused PID never matches.
  * NIC gate: for a file of the RDMA verbs device (uverbs) a tenant task (protected cgroup) that is not sealed is denied
  * (-EPERM) BEFORE the uverbs handler runs and SIGKILLed: open of the device, ioctl (the command interface), mmap
- * (doorbell/UAR pages), write (legacy command ABI). The check runs per call, so an inherited or passed FD is covered. */
+ * (doorbell/UAR pages), write (legacy command ABI). The check runs per call, so an inherited or passed FD is covered.
+ * Request Q: the decision also depends on WHICH device the uverbs file belongs to (i_rdev of its inode):
+ *  - the operator-selected device(s) of the tenant (sel[]): only a sealed tenant process may use them; a process
+ *    outside the tenant cgroup (e.g. one that received a tenant fd) is denied (-EPERM), not killed;
+ *  - any other uverbs device: a tenant process (sealed or not) is denied + SIGKILLed; others are not concerned.
+ *  - the status is removed when the LAST thread of the process exits (signal->live == 0), not when the leader exits. */
 #include <bpf/bpf_core_read.h>
 struct file_operations;
 struct inode { __u32 i_rdev; } __attribute__((preserve_access_index));
 struct file { const struct file_operations *f_op; struct inode *f_inode; } __attribute__((preserve_access_index));
-struct task_struct { int pid; int tgid; struct task_struct *group_leader; __u64 start_boottime; } __attribute__((preserve_access_index));
+typedef struct { int counter; } chap_atomic_t;
+struct signal_struct { chap_atomic_t live; } __attribute__((preserve_access_index));
+struct task_struct { int pid; int tgid; struct task_struct *group_leader; __u64 start_boottime; struct signal_struct *signal; } __attribute__((preserve_access_index));
 
 #define CHAP_TICK_NS 10000000ULL      /* nsec_to_clock_t with USER_HZ=100: /proc/<pid>/stat starttime unit */
 #define NG_MAXDEV 16
 struct sproc { __u64 start_ticks; __u32 origin; __u32 parent; __u64 reg_ns; };   /* origin 1 Manager, 2 fork */
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
          __uint(key_size, sizeof(__u32)); __uint(value_size, sizeof(struct sproc)); } sealed_procs SEC(".maps");
-/* fops0/fops1 = uverbs_fops / uverbs_mmap_fops (ib_uverbs); dev[] = kernel dev_t (major<<20|minor) of uverbs nodes */
-struct ngcfg { __u64 fops0, fops1; __u32 enabled, ndev; __u32 dev[NG_MAXDEV]; };
+/* fops0/fops1 = uverbs_fops / uverbs_mmap_fops (ib_uverbs); dev[] = kernel dev_t (major<<20|minor) of all uverbs
+   nodes; sel[] = the operator-selected device(s) of this tenant */
+struct ngcfg { __u64 fops0, fops1; __u32 enabled, ndev; __u32 dev[NG_MAXDEV]; __u32 nsel, pad; __u32 sel[NG_MAXDEV]; };
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
          __uint(key_size, sizeof(__u32)); __uint(value_size, sizeof(struct ngcfg)); } nicgate_cfg SEC(".maps");
 /* counters: [2k] allowed / [2k+1] denied for k = 1 open, 2 ioctl, 3 ioctl_compat, 4 mmap, 5 write;
-   [12] fork inherit, [13] exec unseal, [14] exit clear, [15] stale identity removed */
+   [12] fork inherit, [13] exec unseal, [14] exit clear, [15] stale identity removed;
+   [0] tenant task on a non-selected uverbs device (denied + killed), [1] selected device used outside the tenant (denied) */
 struct ngstat { __u64 v[16]; };
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1);
          __uint(key_size, sizeof(__u32)); __uint(value_size, sizeof(struct ngstat)); } nicgate_stats SEC(".maps");
@@ -214,10 +223,24 @@ static __always_inline int cur_sealed(void)
     return 1;
 }
 
-static __always_inline int ng_decide(__u32 kind)
+static __always_inline int ng_in(const __u32 *lst, __u32 n, __u32 rdev)
+{
+    int hit = 0; if (n > NG_MAXDEV) n = NG_MAXDEV;
+#pragma unroll
+    for (int i = 0; i < NG_MAXDEV; i++) { if (i < (int)n && lst[i] == rdev) hit = 1; }
+    return hit;
+}
+
+/* kind: 1 open, 2 ioctl, 3 ioctl_compat, 4 mmap, 5 write; rdev = device of the uverbs file */
+static __always_inline int ng_decide(__u32 kind, struct ngcfg *c, __u32 rdev)
 {
     __u64 cg;
-    if (!in_protected_cg(&cg)) return 0;            /* not a tenant task */
+    int sel = ng_in(c->sel, c->nsel, rdev);
+    if (!in_protected_cg(&cg)) {                    /* not a tenant task */
+        if (!sel) return 0;                         /* not the tenant's NIC */
+        ngstat_inc(1); return -1;                   /* tenant NIC outside the tenant (e.g. a passed fd): -EPERM */
+    }
+    if (!sel) { ngstat_inc(0); report_and_kill(cg, 9110 + kind, 0); return -1; }   /* another NIC, even if sealed */
     if (cur_sealed()) { ngstat_inc(kind * 2); return 0; }
     ngstat_inc(kind * 2 + 1);
     report_and_kill(cg, 9100 + kind, 0);            /* SIGKILL the unsealed tenant process */
@@ -240,41 +263,36 @@ int BPF_PROG(ng_open, struct file *file, int ret)
     if (ret) return ret;
     struct ngcfg *c = ng_cfg(); if (!c) return 0;
     __u32 rdev = BPF_CORE_READ(file, f_inode, i_rdev);
-    if (!rdev) return 0;
-    __u32 n = c->ndev; if (n > NG_MAXDEV) n = NG_MAXDEV;
-    int hit = 0;
-#pragma unroll
-    for (int i = 0; i < NG_MAXDEV; i++) { if (i < (int)n && c->dev[i] == rdev) hit = 1; }
-    if (!hit) return 0;
-    return ng_decide(1);
+    if (!rdev || !ng_in(c->dev, c->ndev, rdev)) return 0;
+    return ng_decide(1, c, rdev);
 }
 SEC("fmod_ret/security_file_ioctl")
 int BPF_PROG(ng_ioctl, struct file *file, unsigned int cmd, unsigned long arg, int ret)
 {
     if (ret) return ret;
     struct ngcfg *c = ng_cfg(); if (!c || !ng_is_uverbs_fop(file, c)) return 0;
-    return ng_decide(2);
+    return ng_decide(2, c, BPF_CORE_READ(file, f_inode, i_rdev));
 }
 SEC("fmod_ret/security_file_ioctl_compat")
 int BPF_PROG(ng_ioctl32, struct file *file, unsigned int cmd, unsigned long arg, int ret)
 {
     if (ret) return ret;
     struct ngcfg *c = ng_cfg(); if (!c || !ng_is_uverbs_fop(file, c)) return 0;
-    return ng_decide(3);
+    return ng_decide(3, c, BPF_CORE_READ(file, f_inode, i_rdev));
 }
 SEC("fmod_ret/security_mmap_file")
 int BPF_PROG(ng_mmap, struct file *file, unsigned long prot, unsigned long flags, int ret)
 {
     if (ret || !file) return ret;
     struct ngcfg *c = ng_cfg(); if (!c || !ng_is_uverbs_fop(file, c)) return 0;
-    return ng_decide(4);
+    return ng_decide(4, c, BPF_CORE_READ(file, f_inode, i_rdev));
 }
 SEC("fmod_ret/security_file_permission")
 int BPF_PROG(ng_write, struct file *file, int mask, int ret)
 {
     if (ret || !(mask & 2 /* MAY_WRITE */)) return ret;
     struct ngcfg *c = ng_cfg(); if (!c || !ng_is_uverbs_fop(file, c)) return 0;
-    return ng_decide(5);
+    return ng_decide(5, c, BPF_CORE_READ(file, f_inode, i_rdev));
 }
 
 /* a NEW process (not a thread) forked by a sealed process inherits the sealed agent regions -> inherits the status */
@@ -301,12 +319,14 @@ int BPF_PROG(ng_exec, struct task_struct *p, int old_pid, void *bprm)
     if (bpf_map_delete_elem(&sealed_procs, &t) == 0) ngstat_inc(13);
     return 0;
 }
-/* exit of the process (group leader) removes the status; the start-time identity covers any later PID reuse */
+/* exit of the LAST thread of the process removes the status (Request Q: a leader that exits first leaves the process
+   alive; do_exit has decremented signal->live before this tracepoint, so live == 0 only for the last thread). The
+   start-time identity covers any later PID reuse. */
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(ng_exit, struct task_struct *p)
 {
-    __u32 pid = BPF_CORE_READ(p, pid), t = BPF_CORE_READ(p, tgid);
-    if (pid != t) return 0;
+    __u32 t = BPF_CORE_READ(p, tgid);
+    if (BPF_CORE_READ(p, signal, live.counter) != 0) return 0;
     if (bpf_map_delete_elem(&sealed_procs, &t) == 0) ngstat_inc(14);
     return 0;
 }
