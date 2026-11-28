@@ -270,7 +270,7 @@ if [ "${FAIL_INJECT:-}" = "range_drop" ]; then   # drop the registered range tha
   NEXP=$(grep -c . "$O/sealed_ranges_merged.txt")
 fi
 python3 -I "$MG/chap_e_tools.py" rangecheck "$TPID" "$O/sealed_ranges_merged.txt" > "$O/rangecheck.txt" 2>&1; RCOK=$?
-BLOCK_EXEC=${BLOCK_EXEC:-1}   # Request P: legacy exec block kept until the NIC gate is verified on the real NIC
+BLOCK_EXEC=${BLOCK_EXEC:-0}   # Request P: exec allowed; a new program starts unsealed and the NIC gate stops its NIC access (BLOCK_EXEC=1 restores the legacy exec block)
 if "$IK/integ_setranges" "$PIND/protected_ranges" "$PIND/integ_ctl" "$O/sealed_ranges_merged.txt" "$CS" "$CE" "$BLOCK_EXEC" >> "$O/integ.log" 2>&1; then   # block_exec=$BLOCK_EXEC from here on
   NR=$(grep -a 'TOTAL n_ranges' "$O/integ.log"|tail -1|grep -oE "n_ranges=[0-9]+"|grep -oE "[0-9]+"); tl RANGES_REGISTERED n=$NR
   { [ "$RCOK" = 0 ] && [ "${NR:-0}" = "$((NEXP+1))" ]; } && mark integrity_range_register REQUIRED PASS "n_ranges=$NR = $NEXP merged sealed ranges (W^X+ufunc+imm-view+selector+rodata+kernel-map-RO+HS+dispatch+agent/engine code) + hook code seg; $(cat $O/merge.txt); $(tail -1 $O/rangecheck.txt)" \
